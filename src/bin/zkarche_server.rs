@@ -2,21 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-#[path = "../common/metrics.rs"]
-mod metrics;
-#[path = "../common/io_counted.rs"]
-mod io_counted;
-#[path = "../common/net.rs"]
-mod net;
-#[path = "../common/fs_secure.rs"]
-mod fs_secure;
+use std::time::{Duration, Instant};
 
 use blake2::{Blake2b512, Digest};
 use chacha20poly1305::{
@@ -34,34 +27,40 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use zeroize::Zeroize;
 
-use fs_secure::{ensure_parent_dir, verify_private_file_permissions, write_private_file_atomic};
-use io_counted::{recv_blob, recv_exact, recv_u8, send_all, send_blob};
-use metrics::PhaseMetrics;
-use net::configure_stream;
-
 type HmacSha256 = Hmac<Sha256>;
 
 const SETUP_CHALLENGE_LEN: usize = 16;
 
 const MSG_SETUP: u8 = 0x01;
 const MSG_AUTH_V2: u8 = 0x03;
+#[allow(dead_code)]
 const MSG_GOODBYE: u8 = 0x15;
 
+// NOTE: ZK-ARCHE v2 registry on-disk format is 96 bytes per record
+// (device_id + pubkey + role_commitment). This is a breaking change from v1's
+// 104-byte format; all enrolled devices must re-enroll after upgrade.
 const REGISTRY_BIN: &str = "state/server/registry.bin";
 const REGISTRY_BAK: &str = "state/server/registry.bak";
 const REPLAY_CACHE_BIN: &str = "state/server/replay_cache.bin";
 const SERVER_SK_FILE: &str = "state/server/server_sk.bin";
-const OFFLINE_COUNTERS_BIN: &str = "state/server/offline_counters.bin";
 
+// Enrollment (setup) domain separators — unchanged from v1.
 const T_SETUP: &[u8] = b"setup_client_schnorr_v1";
 const T_SETUP_SERVER: &[u8] = b"setup_server_schnorr_v1";
-const T_CLIENT: &[u8] = b"client_schnorr_v1";
 const T_SERVER: &[u8] = b"server_schnorr_v1";
-const T_KC: &[u8] = b"kc_v1";
-const T_OFFLINE: &[u8] = b"offline_schnorr_v1";
-const T_ATTR_ROLE: &[u8] = b"client_attr_role_v1";
 
+// ZK-ARCHE v2 online-auth domain separators. All transcripts bind to the
+// per-session pseudonym `pid` rather than the stable `device_id`.
+const T_PID: &[u8] = b"iot-auth/pid/v1";
+const T_CLIENT_V2: &[u8] = b"client_schnorr_v2";
+const T_KC_V2: &[u8] = b"kc_v2";
+const T_ROLE_SET: &[u8] = b"client_role_set_v1";
+const T_ROLE_RERAND: &[u8] = b"client_role_rerand_v1";
 
+// Authorized role class for the set-membership proof. Must match the client.
+const ALLOWED_ROLES: &[u64] = &[1u64, 2u64];
+
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MAX_ENCRYPTED_PAYLOAD: usize = 4096;
 
@@ -69,7 +68,6 @@ const REPLAY_GEN_MAX: usize = 25_000;
 const REPLAY_PERSIST_EVERY_INSERTS: usize = 64;
 const REPLAY_PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_ACTIVE_CONNECTIONS: usize = 128;
-const MAX_OFFLINE_FIELD: usize = 256;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const FAILURE_BAN: Duration = Duration::from_secs(120);
 const MAX_FAILURES_PER_WINDOW: u32 = 8;
@@ -78,7 +76,6 @@ const MAX_FAILURES_PER_WINDOW: u32 = 8;
 struct DeviceRecord {
     pubkey: RistrettoPoint,
     role_commitment: RistrettoPoint,
-    role_code: u64,
 }
 
 /// Tracks a monotonically increasing AEAD nonce counter so each encryption uses a unique 96-bit nonce.
@@ -136,6 +133,7 @@ impl CompatTranscript {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 /// Wraps the supported value types that can be appended into a compatibility transcript.
 enum TranscriptValue<'a> {
     Bytes(&'a [u8]),
@@ -264,19 +262,20 @@ fn schnorr_prove_setup_server(
     (a, s)
 }
 
-/// Verifies the client online-authentication Schnorr proof against the registered device key.
+/// Verifies the client online-authentication Schnorr proof against the registered
+/// device key. v2: binds to the session pseudonym `pid` under T_CLIENT_V2.
 fn schnorr_verify_auth(
     expected_pubkey: &RistrettoPoint,
-    device_id: &[u8; 32],
+    pid: &[u8; 32],
     a: &RistrettoPoint,
     s: &Scalar,
     nonce_c: &[u8; 32],
     eph_c: &RistrettoPoint,
 ) -> bool {
     let c = transcript_challenge_scalar(
-        T_CLIENT,
+        T_CLIENT_V2,
         &[
-            (b"device_id", TranscriptValue::Bytes(device_id)),
+            (b"pid", TranscriptValue::Bytes(pid)),
             (b"pubkey", TranscriptValue::Point(expected_pubkey)),
             (b"a", TranscriptValue::Point(a)),
             (b"nonce_c", TranscriptValue::Bytes(nonce_c)),
@@ -308,40 +307,154 @@ fn schnorr_prove_server(
     (a, s)
 }
 
-fn verify_role_commitment_opening(
-    commitment: &RistrettoPoint,
+/// Derives the per-session pseudonym `pid` = H(T_PID || device_pub || nonce_c
+/// || eph_c || server_pub). Deterministic so the server can recompute it from
+/// each enrolled device_pub and find the matching record.
+fn compute_pid(
+    device_pub: &RistrettoPoint,
+    nonce_c: &[u8; 32],
+    eph_c: &RistrettoPoint,
+    server_pub: &RistrettoPoint,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    sha2::Digest::update(&mut h, &(T_PID.len() as u32).to_le_bytes());
+    sha2::Digest::update(&mut h, T_PID);
+    sha2::Digest::update(&mut h, device_pub.compress().as_bytes());
+    sha2::Digest::update(&mut h, nonce_c);
+    sha2::Digest::update(&mut h, eph_c.compress().as_bytes());
+    sha2::Digest::update(&mut h, server_pub.compress().as_bytes());
+    let out = h.finalize();
+    let mut pid = [0u8; 32];
+    pid.copy_from_slice(&out);
+    pid
+}
+
+/// Verifies the client's proof that the fresh wire commitment C' is a
+/// re-randomization of the stored commitment C, i.e., that the client knows
+/// some delta such that (C' - C) = h * delta. Binds C' back to the commitment
+/// enrolled at setup time without revealing the opening of either.
+fn verify_role_rerandomization(
+    stored_c: &RistrettoPoint,
+    c_prime: &RistrettoPoint,
     a: &RistrettoPoint,
-    s_attr: &Scalar,
-    s_blind: &Scalar,
-    device_id: &[u8; 32],
+    s: &Scalar,
+    pid: &[u8; 32],
     nonce_c: &[u8; 32],
     eph_c: &RistrettoPoint,
 ) -> bool {
     let h = attr_h();
-
+    let diff = c_prime - stored_c;
     let c = transcript_challenge_scalar(
-        T_ATTR_ROLE,
+        T_ROLE_RERAND,
         &[
-            (b"device_id", TranscriptValue::Bytes(device_id)),
-            (b"commitment", TranscriptValue::Point(commitment)),
-            (b"a", TranscriptValue::Point(a)),
+            (b"pid", TranscriptValue::Bytes(pid)),
             (b"nonce_c", TranscriptValue::Bytes(nonce_c)),
             (b"eph_c", TranscriptValue::Point(eph_c)),
+            (b"stored_c", TranscriptValue::Point(stored_c)),
+            (b"c_prime", TranscriptValue::Point(c_prime)),
+            (b"a", TranscriptValue::Point(a)),
         ],
     );
-
-    let lhs = (RISTRETTO_BASEPOINT_POINT * s_attr) + (h * s_blind);
-    let rhs = *a + (*commitment * c);
-    lhs == rhs
+    // Schnorr check in base h: h * s == a + (C' - C) * c.
+    h * s == *a + diff * c
 }
 
-/// Derives the shared session key from the Ristretto ECDHE secret, handshake nonces, identities, and X25519 tunnel binding.
+/// Verifies the CDS OR-proof that C' = g^role * h^blind' for some role in
+/// ALLOWED_ROLES, without revealing which. For every i the proof supplies
+/// (A_i, c_i, s_i); the verifier checks that Σ c_i equals the Fiat-Shamir
+/// challenge over the session transcript, and that each branch satisfies
+/// h * s_i == A_i + (C' - g^{r_i}) * c_i.
+fn verify_role_set_membership(
+    c_prime: &RistrettoPoint,
+    proof: &[(RistrettoPoint, Scalar, Scalar)],
+    pid: &[u8; 32],
+    nonce_c: &[u8; 32],
+    eph_c: &RistrettoPoint,
+) -> bool {
+    if proof.len() != ALLOWED_ROLES.len() {
+        return false;
+    }
+    let h = attr_h();
+    let n = ALLOWED_ROLES.len();
+
+    // Reject identity A_i as a sanity check (defense in depth against crafted
+    // degenerate proofs). Note that individual A_i being identity is not
+    // necessarily unsound here — the binding is via the master challenge — but
+    // we reject to match the client's `reject_identity` hygiene elsewhere and
+    // keep the handshake uniform.
+    for (a_i, _, _) in proof.iter() {
+        if *a_i == RistrettoPoint::default() {
+            return false;
+        }
+    }
+
+    // Rebuild the master challenge over the same transcript the client used.
+    let mut transcript = CompatTranscript::new(T_ROLE_SET);
+    transcript.append_message(b"pid", pid);
+    transcript.append_message(b"nonce_c", nonce_c);
+    transcript.append_message(b"eph_c", eph_c.compress().as_bytes());
+    transcript.append_message(b"c_prime", c_prime.compress().as_bytes());
+    for (i, r) in ALLOWED_ROLES.iter().enumerate() {
+        let label = format!("r_{}", i);
+        transcript.append_message(label.as_bytes(), &r.to_le_bytes());
+    }
+    for (i, (a, _, _)) in proof.iter().enumerate() {
+        let label = format!("A_{}", i);
+        transcript.append_message(label.as_bytes(), a.compress().as_bytes());
+    }
+    let master_c = transcript.challenge_scalar();
+
+    // Check sum of c_i.
+    let mut sum = Scalar::from(0u64);
+    for (_, c_i, _) in proof.iter() {
+        sum += c_i;
+    }
+    if sum != master_c {
+        return false;
+    }
+
+    // Check each branch's DLog-in-base-h equation: h * s_i == A_i + Y_i * c_i,
+    // where Y_i = C' - g^{r_i}.
+    for (i, (a_i, c_i, s_i)) in proof.iter().enumerate() {
+        let y_i = c_prime - RISTRETTO_BASEPOINT_POINT * Scalar::from(ALLOWED_ROLES[i]);
+        let lhs = h * s_i;
+        let rhs = *a_i + y_i * c_i;
+        if lhs != rhs {
+            return false;
+        }
+    }
+    true
+}
+
+/// Scans the registry for the device whose public key yields `pid`. Returns
+/// (device_id, record) on match. This is O(N) in the registry size — fine for
+/// a research-scale prototype; a production deployment would want an indexed
+/// lookup or a stable pseudonymous handle issued at enrollment.
+fn lookup_record_by_pid(
+    reg: &HashMap<[u8; 32], DeviceRecord>,
+    pid: &[u8; 32],
+    nonce_c: &[u8; 32],
+    eph_c: &RistrettoPoint,
+    server_pub: &RistrettoPoint,
+) -> Option<([u8; 32], DeviceRecord)> {
+    for (id, rec) in reg.iter() {
+        let candidate = compute_pid(&rec.pubkey, nonce_c, eph_c, server_pub);
+        if candidate.ct_eq(pid).unwrap_u8() == 1 {
+            return Some((*id, *rec));
+        }
+    }
+    None
+}
+
+/// Derives the shared session key from the Ristretto ECDHE secret, handshake
+/// nonces, the session pseudonym `pid`, and X25519 tunnel binding. v2: binds
+/// to `pid` rather than `device_id`.
 fn derive_session_key(
     eph_secret: &Scalar,
     peer_eph_pub: &RistrettoPoint,
     nonce_c: &[u8; 32],
     nonce_s: &[u8; 32],
-    device_id: &[u8; 32],
+    pid: &[u8; 32],
     eph_c: &RistrettoPoint,
     eph_s: &RistrettoPoint,
     x25519_shared: &[u8; 32],
@@ -353,9 +466,9 @@ fn derive_session_key(
     salt[..32].copy_from_slice(nonce_c);
     salt[32..].copy_from_slice(nonce_s);
 
-    let mut info = Vec::with_capacity(11 + 32 + 32 + 32 + 32);
-    info.extend_from_slice(b"session key");
-    info.extend_from_slice(device_id);
+    let mut info = Vec::with_capacity(14 + 32 + 32 + 32 + 32);
+    info.extend_from_slice(b"session key v2");
+    info.extend_from_slice(pid);
     info.extend_from_slice(eph_c.compress().as_bytes());
     info.extend_from_slice(eph_s.compress().as_bytes());
     info.extend_from_slice(x25519_shared);
@@ -366,9 +479,10 @@ fn derive_session_key(
     okm
 }
 
-/// Hashes the full key-confirmation transcript so both peers MAC the exact same authenticated session state.
+/// Hashes the full key-confirmation transcript so both peers MAC the exact
+/// same authenticated session state. v2: binds to `pid` under T_KC_V2.
 fn kc_transcript_hash(
-    device_id: &[u8; 32],
+    pid: &[u8; 32],
     a_c: &RistrettoPoint,
     s_c: &Scalar,
     nonce_c: &[u8; 32],
@@ -379,8 +493,8 @@ fn kc_transcript_hash(
     nonce_s: &[u8; 32],
     eph_s: &RistrettoPoint,
 ) -> [u8; 32] {
-    let mut t = CompatTranscript::new(T_KC);
-    t.append_message(b"device_id", device_id);
+    let mut t = CompatTranscript::new(T_KC_V2);
+    t.append_message(b"pid", pid);
     t.append_message(b"a_c", a_c.compress().as_bytes());
     t.append_message(b"s_c", &s_c.to_bytes());
     t.append_message(b"nonce_c", nonce_c);
@@ -420,8 +534,25 @@ fn hmac_tag(key: &[u8; 32], label: &[u8], th: &[u8; 32]) -> [u8; 32] {
     tag
 }
 
+/// Writes the full buffer to the stream and updates the transmitted-byte counter.
+fn send_all(stream: &mut impl Write, buf: &[u8], sent: &mut usize) -> std::io::Result<()> {
+    *sent += buf.len();
+    stream.write_all(buf)
+}
 
+/// Reads an exact number of bytes from the stream and updates the received-byte counter.
+fn recv_exact(stream: &mut impl Read, buf: &mut [u8], recv: &mut usize) -> std::io::Result<()> {
+    stream.read_exact(buf)?;
+    *recv += buf.len();
+    Ok(())
+}
 
+/// Reads a single byte from the stream.
+fn recv_u8(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<u8> {
+    let mut b = [0u8; 1];
+    recv_exact(stream, &mut b, recv)?;
+    Ok(b[0])
+}
 
 /// Reads a 32-byte device identifier from the stream.
 fn recv_device_id(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<[u8; 32]> {
@@ -449,6 +580,24 @@ fn recv_scalar(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Scal
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical scalar"))
 }
 
+/// Reads a length-prefixed ciphertext while enforcing a strict maximum payload size.
+fn recv_encrypted_blob(
+    stream: &mut impl Read,
+    recv: &mut usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    recv_exact(stream, &mut len_buf, recv)?;
+    let rx_len = u32::from_le_bytes(len_buf) as usize;
+    if rx_len > MAX_ENCRYPTED_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("payload too large: {rx_len} bytes (max {MAX_ENCRYPTED_PAYLOAD})"),
+        ));
+    }
+    let mut buf = vec![0u8; rx_len];
+    recv_exact(stream, &mut buf, recv)?;
+    Ok(buf)
+}
 
 /// Reads the optional setup pairing token and validates its UTF-8 length constraints.
 fn recv_pairing_token(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Option<String>> {
@@ -469,27 +618,30 @@ fn recv_pairing_token(stream: &mut impl Read, recv: &mut usize) -> std::io::Resu
     Ok(Some(s))
 }
 
-/// Loads the device registry mapping device identifiers to registered static public keys.
+/// Loads the device registry mapping device identifiers to registered static
+/// public keys and enrolled role commitments. v2 on-disk format is 96 bytes
+/// per record (32 device_id + 32 pubkey + 32 role_commitment); the v1 104-byte
+/// format with a trailing `role_code` is no longer supported — re-enroll after
+/// upgrade.
 fn load_registry(path: &str) -> std::io::Result<HashMap<[u8; 32], DeviceRecord>> {
     let mut reg = HashMap::new();
     let data = fs::read(path).unwrap_or_default();
     if data.is_empty() {
         return Ok(reg);
     }
-    if data.len() % 104 != 0 {
+    if data.len() % 96 != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "registry.bin corrupt length",
+            "registry.bin corrupt length (v2 expects 96-byte chunks; re-enroll if upgrading from v1)",
         ));
     }
-    for chunk in data.chunks_exact(104) {
+    for chunk in data.chunks_exact(96) {
         let mut id = [0u8; 32];
         id.copy_from_slice(&chunk[0..32]);
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&chunk[32..64]);
         let mut role_commitment_bytes = [0u8; 32];
         role_commitment_bytes.copy_from_slice(&chunk[64..96]);
-        let role_code = u64::from_le_bytes(chunk[96..104].try_into().unwrap());
 
         let pubkey = CompressedRistretto(pk)
             .decompress()
@@ -507,14 +659,14 @@ fn load_registry(path: &str) -> std::io::Result<HashMap<[u8; 32], DeviceRecord>>
             DeviceRecord {
                 pubkey,
                 role_commitment,
-                role_code,
             },
         );
     }
     Ok(reg)
 }
 
-/// Atomically persists the device registry and keeps a backup copy of the previous version.
+/// Atomically persists the device registry and keeps a backup copy of the
+/// previous version.
 fn save_registry_atomic(
     path: &str,
     bak_path: &str,
@@ -526,20 +678,79 @@ fn save_registry_atomic(
         let _ = fs::copy(path, bak_path);
     }
     let _tmp = format!("{path}.tmp");
-    let mut out = Vec::with_capacity(reg.len() * 104);
+    let mut out = Vec::with_capacity(reg.len() * 96);
     for (id, rec) in reg {
         out.extend_from_slice(id);
         out.extend_from_slice(rec.pubkey.compress().as_bytes());
         out.extend_from_slice(rec.role_commitment.compress().as_bytes());
-        out.extend_from_slice(&rec.role_code.to_le_bytes());
     }
     write_private_file_atomic(path, &out)?;
     Ok(())
 }
 
+/// Atomically writes sensitive state to disk using a temporary file and private permissions.
+fn write_private_file_atomic(path: &str, data: &[u8]) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let tmp = format!("{path}.tmp");
+    #[cfg(unix)]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
 
+#[cfg(unix)]
+/// Ensures a sensitive file is not readable by group or world on Unix systems.
+fn verify_private_file_permissions(path: &str) -> std::io::Result<()> {
+    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{path} must not be group/world accessible (mode {:o})", mode),
+        ));
+    }
+    Ok(())
+}
 
+#[cfg(not(unix))]
+/// Ensures a sensitive file is not readable by group or world on Unix systems.
+fn verify_private_file_permissions(_path: &str) -> std::io::Result<()> {
+    Ok(())
+}
 
+/// Sends a length-prefixed binary blob.
+fn send_blob(stream: &mut impl Write, buf: &[u8], sent: &mut usize) -> std::io::Result<()> {
+    send_all(stream, &(buf.len() as u32).to_le_bytes(), sent)?;
+    if !buf.is_empty() { send_all(stream, buf, sent)?; }
+    Ok(())
+}
+
+/// Creates the parent directory for a state file when it does not already exist.
+fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
 
 /// Loads the server static secret key from disk or creates one on first boot.
 fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
@@ -621,9 +832,9 @@ impl ReplayCache {
         out
     }
 
-    fn check_and_insert(&mut self, device_id: &[u8; 32], nonce_c: &[u8; 32]) -> bool {
+    fn check_and_insert(&mut self, id: &[u8; 32], nonce_c: &[u8; 32]) -> bool {
         let mut k = [0u8; 64];
-        k[..32].copy_from_slice(device_id);
+        k[..32].copy_from_slice(id);
         k[32..].copy_from_slice(nonce_c);
 
         if self.current.contains(&k) || self.previous.contains(&k) {
@@ -766,218 +977,6 @@ impl Drop for ActiveConnGuard {
     }
 }
 
-#[derive(Debug, Clone)]
-/// Represents a serialized offline authorization proof and its metadata.
-struct OfflineProof {
-    version: u8,
-    device_id: [u8; 32],
-    device_pub: [u8; 32],
-    issued_at: u64,
-    expires_at: u64,
-    counter: u64,
-    audience: Vec<u8>,
-    scope: Vec<u8>,
-    request_hash: [u8; 32],
-    a: [u8; 32],
-    s: [u8; 32],
-}
-
-/// Represents a serialized offline authorization proof and its metadata.
-impl OfflineProof {
-    fn deserialize(buf: &[u8]) -> std::io::Result<Self> {
-        let mut idx = 0usize;
-        fn take<'a>(buf: &'a [u8], idx: &mut usize, n: usize) -> std::io::Result<&'a [u8]> {
-            if buf.len().saturating_sub(*idx) < n {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "offline proof truncated"));
-            }
-            let out = &buf[*idx..*idx + n];
-            *idx += n;
-            Ok(out)
-        }
-        let version = take(buf, &mut idx, 1)?[0];
-        let mut device_id = [0u8; 32];
-        device_id.copy_from_slice(take(buf, &mut idx, 32)?);
-        let mut device_pub = [0u8; 32];
-        device_pub.copy_from_slice(take(buf, &mut idx, 32)?);
-        let issued_at = u64::from_le_bytes(take(buf, &mut idx, 8)?.try_into().unwrap());
-        let expires_at = u64::from_le_bytes(take(buf, &mut idx, 8)?.try_into().unwrap());
-        let counter = u64::from_le_bytes(take(buf, &mut idx, 8)?.try_into().unwrap());
-        let audience_len = u16::from_le_bytes(take(buf, &mut idx, 2)?.try_into().unwrap()) as usize;
-        if audience_len == 0 || audience_len > MAX_OFFLINE_FIELD {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid offline audience length"));
-        }
-        let audience = take(buf, &mut idx, audience_len)?.to_vec();
-        let scope_len = u16::from_le_bytes(take(buf, &mut idx, 2)?.try_into().unwrap()) as usize;
-        if scope_len == 0 || scope_len > MAX_OFFLINE_FIELD {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid offline scope length"));
-        }
-        let scope = take(buf, &mut idx, scope_len)?.to_vec();
-        let mut request_hash = [0u8; 32];
-        request_hash.copy_from_slice(take(buf, &mut idx, 32)?);
-        let mut a = [0u8; 32];
-        a.copy_from_slice(take(buf, &mut idx, 32)?);
-        let mut s = [0u8; 32];
-        s.copy_from_slice(take(buf, &mut idx, 32)?);
-        if idx != buf.len() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "offline proof has trailing bytes"));
-        }
-        Ok(Self { version, device_id, device_pub, issued_at, expires_at, counter, audience, scope, request_hash, a, s })
-    }
-}
-
-#[derive(Default)]
-/// Stores the highest accepted offline-proof counter for each device.
-struct OfflineCounterStore {
-    highest: HashMap<[u8; 32], u64>,
-}
-
-/// Stores the highest accepted offline-proof counter for each device.
-impl OfflineCounterStore {
-    fn load(path: &str) -> std::io::Result<Self> {
-        if !Path::new(path).exists() {
-            return Ok(Self::default());
-        }
-        let data = fs::read(path)?;
-        if data.len() % 40 != 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "offline counter store corrupt"));
-        }
-        let mut highest = HashMap::new();
-        for chunk in data.chunks_exact(40) {
-            let mut id = [0u8; 32];
-            id.copy_from_slice(&chunk[..32]);
-            let ctr = u64::from_le_bytes(chunk[32..40].try_into().unwrap());
-            highest.insert(id, ctr);
-        }
-        Ok(Self { highest })
-    }
-
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.highest.len() * 40);
-        for (id, ctr) in &self.highest {
-            out.extend_from_slice(id);
-            out.extend_from_slice(&ctr.to_le_bytes());
-        }
-        out
-    }
-
-    fn check_and_update(&mut self, device_id: &[u8; 32], counter: u64) -> std::io::Result<()> {
-        match self.highest.get(device_id).copied() {
-            Some(prev) if counter <= prev => Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("offline counter replay detected (counter={} prev={})", counter, prev),
-            )),
-            _ => {
-                self.highest.insert(*device_id, counter);
-                Ok(())
-            }
-        }
-    }
-}
-
-/// Returns the current Unix timestamp in seconds.
-fn unix_time_now() -> std::io::Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("system time error: {e}")))?
-        .as_secs())
-}
-
-/// Builds the challenge scalar used for offline authorization proofs.
-fn offline_challenge_scalar(
-    device_id: &[u8; 32],
-    device_pub: &RistrettoPoint,
-    audience: &[u8],
-    scope: &[u8],
-    issued_at: u64,
-    expires_at: u64,
-    counter: u64,
-    request_hash: &[u8; 32],
-    a: &RistrettoPoint,
-) -> Scalar {
-    transcript_challenge_scalar(
-        T_OFFLINE,
-        &[
-            (b"device_id", TranscriptValue::Bytes(device_id)),
-            (b"pubkey", TranscriptValue::Point(device_pub)),
-            (b"audience", TranscriptValue::Bytes(audience)),
-            (b"scope", TranscriptValue::Bytes(scope)),
-            (b"issued_at", TranscriptValue::U64(issued_at)),
-            (b"expires_at", TranscriptValue::U64(expires_at)),
-            (b"counter", TranscriptValue::U64(counter)),
-            (b"request_hash", TranscriptValue::Bytes(request_hash)),
-            (b"a", TranscriptValue::Point(a)),
-        ],
-    )
-}
-
-/// Verifies an offline authorization proof against registry state, scope policy, counter monotonicity, and expiry.
-fn verify_offline_proof(
-    proof_path: &str,
-    expected_audience: &str,
-    allowed_scopes: &HashSet<String>,
-    reg: &HashMap<[u8; 32], RistrettoPoint>,
-    counters: &mut OfflineCounterStore,
-) -> std::io::Result<()> {
-    let proof = OfflineProof::deserialize(&fs::read(proof_path)?)?;
-    if proof.version != 1 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unsupported offline proof version"));
-    }
-    if proof.audience != expected_audience.as_bytes() {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline proof audience mismatch"));
-    }
-    let scope_str = String::from_utf8(proof.scope.clone())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "offline scope is not UTF-8"))?;
-    if !allowed_scopes.contains(&scope_str) {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("offline scope '{}' not allowed", scope_str)));
-    }
-    if proof.issued_at >= proof.expires_at {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "offline proof validity window is invalid"));
-    }
-    let now = unix_time_now()?;
-    if now < proof.issued_at || now > proof.expires_at {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline proof expired or not yet valid"));
-    }
-    if proof.expires_at - proof.issued_at > 300 {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline proof validity exceeds 300 seconds"));
-    }
-    let expected_pub = reg.get(&proof.device_id).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline proof device is not enrolled")
-    })?;
-    if expected_pub.compress().to_bytes().ct_eq(&proof.device_pub).unwrap_u8() == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline proof pubkey mismatch"));
-    }
-    let a = CompressedRistretto(proof.a)
-        .decompress()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "offline proof A invalid"))?;
-    reject_identity(&a, "offline A")?;
-    let s: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(proof.s))
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "offline proof s is non-canonical"))?;
-    let c: Scalar = offline_challenge_scalar(
-        &proof.device_id,
-        expected_pub,
-        &proof.audience,
-        &proof.scope,
-        proof.issued_at,
-        proof.expires_at,
-        proof.counter,
-        &proof.request_hash,
-        &a,
-    );
-    if RISTRETTO_BASEPOINT_POINT * s != a + (*expected_pub * c) {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline Schnorr proof invalid"));
-    }
-    counters.check_and_update(&proof.device_id, proof.counter)?;
-    write_private_file_atomic(OFFLINE_COUNTERS_BIN, &counters.serialize())?;
-    println!(
-        "Server[OFFLINE]: verified offline proof file={} device_id={} scope='{}' counter={} request_hash={}",
-        proof_path,
-        hex::encode(proof.device_id),
-        scope_str,
-        proof.counter,
-        hex::encode(proof.request_hash)
-    );
-    Ok(())
-}
 
 /// Processes a client setup request, validates certificates and setup proofs, enforces pairing policy, and registers the client key.
 /// Step 1: read the incoming setup request, pairing token, client identity, and certificate material.
@@ -1060,7 +1059,6 @@ fn handle_setup(
         reg_w.insert(device_id, DeviceRecord {
             pubkey: device_static_pub,
             role_commitment,
-            role_code: 1u64,
         });
         save_registry_atomic(REGISTRY_BIN, REGISTRY_BAK, &reg_w)?;
         !existed
@@ -1077,8 +1075,15 @@ fn handle_setup(
     Ok(())
 }
 
-/// Processes a live authentication request, enforces replay protection, verifies the registered client, derives the session, and completes key confirmation.
-/// Step 1: establish the outer X25519 tunnel and receive the client's encrypted authentication payload.
+/// Processes a ZK-ARCHE v2 authenticated session request. The client presents
+/// a per-session pseudonym `pid` (not `device_id`); the server scans the
+/// registry to find the matching enrolled device_pub, then verifies: (1) a
+/// Schnorr proof of possession of that device_pub, bound to pid; (2) a
+/// re-randomization proof showing C' is a re-randomization of the enrolled
+/// role commitment; (3) a CDS OR-proof that C' commits to a value in
+/// ALLOWED_ROLES. Replay protection keys on (pid, nonce_c). The session key
+/// and KC transcript likewise bind to pid only, never to device_id, so a
+/// passive observer sees only unlinkable per-session material.
 fn handle_auth_v2(
     mut stream: TcpStream,
     server_static_secret: &Scalar,
@@ -1090,6 +1095,7 @@ fn handle_auth_v2(
     failures: &Arc<Mutex<FailureTracker>>,
     peer_key: &str,
 ) -> std::io::Result<()> {
+    // Outer X25519 tunnel.
     let mut client_pk_bytes = [0u8; 32];
     recv_exact(&mut stream, &mut client_pk_bytes, recv)?;
     let client_pk = X25519Public::from(client_pk_bytes);
@@ -1119,27 +1125,32 @@ fn handle_auth_v2(
     let mut nonce_rx_ctr = NonceCounter::new();
     let mut nonce_tx_ctr = NonceCounter::new();
 
-    let rx_ct = recv_blob(&mut stream, recv, MAX_ENCRYPTED_PAYLOAD)?;
+    // Expected v2 payload: pid(32) | a_c(32) | s_c(32) | nonce_c(32) |
+    //   eph_c(32) | c_prime(32) | rerand_a(32) | rerand_s(32) |
+    //   [ A_i(32) | c_i(32) | s_i(32) ] * ALLOWED_ROLES.len()
+    let n_roles = ALLOWED_ROLES.len();
+    let expected_len = 256 + 96 * n_roles;
+
+    let rx_ct = recv_encrypted_blob(&mut stream, recv)?;
     let pt = cipher_rx
         .decrypt(&nonce_rx_ctr.next(), rx_ct.as_ref())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "decryption failed"))?;
 
-    if pt.len() != 288 {
+    if pt.len() != expected_len {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("invalid payload size: {} (expected 288)", pt.len()),
+            format!("invalid payload size: {} (expected {})", pt.len(), expected_len),
         ));
     }
 
-    let mut device_id   = [0u8; 32]; device_id.copy_from_slice(&pt[0..32]);
-    let mut a_c_bytes   = [0u8; 32]; a_c_bytes.copy_from_slice(&pt[32..64]);
-    let mut s_c_bytes   = [0u8; 32]; s_c_bytes.copy_from_slice(&pt[64..96]);
-    let mut nonce_c     = [0u8; 32]; nonce_c.copy_from_slice(&pt[96..128]);
+    let mut pid = [0u8; 32];         pid.copy_from_slice(&pt[0..32]);
+    let mut a_c_bytes = [0u8; 32];   a_c_bytes.copy_from_slice(&pt[32..64]);
+    let mut s_c_bytes = [0u8; 32];   s_c_bytes.copy_from_slice(&pt[64..96]);
+    let mut nonce_c = [0u8; 32];     nonce_c.copy_from_slice(&pt[96..128]);
     let mut eph_c_bytes = [0u8; 32]; eph_c_bytes.copy_from_slice(&pt[128..160]);
-    let mut role_commitment_bytes = [0u8; 32]; role_commitment_bytes.copy_from_slice(&pt[160..192]);
-    let mut attr_a_bytes = [0u8; 32]; attr_a_bytes.copy_from_slice(&pt[192..224]);
-    let mut attr_s_attr_bytes = [0u8; 32]; attr_s_attr_bytes.copy_from_slice(&pt[224..256]);
-    let mut attr_s_blind_bytes = [0u8; 32]; attr_s_blind_bytes.copy_from_slice(&pt[256..288]);
+    let mut c_prime_bytes = [0u8; 32]; c_prime_bytes.copy_from_slice(&pt[160..192]);
+    let mut rerand_a_bytes = [0u8; 32]; rerand_a_bytes.copy_from_slice(&pt[192..224]);
+    let mut rerand_s_bytes = [0u8; 32]; rerand_s_bytes.copy_from_slice(&pt[224..256]);
 
     let a_c = CompressedRistretto(a_c_bytes)
         .decompress()
@@ -1154,29 +1165,47 @@ fn handle_auth_v2(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid eph_c"))?;
     reject_identity(&eph_c, "eph_c")?;
 
-    let role_commitment = CompressedRistretto(role_commitment_bytes)
+    let c_prime = CompressedRistretto(c_prime_bytes)
         .decompress()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid role_commitment"))?;
-    reject_identity(&role_commitment, "role_commitment")?;
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid c_prime"))?;
+    reject_identity(&c_prime, "c_prime")?;
 
-    let attr_a = CompressedRistretto(attr_a_bytes)
+    let rerand_a = CompressedRistretto(rerand_a_bytes)
         .decompress()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid attr_a"))?;
-    reject_identity(&attr_a, "attr_a")?;
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid rerand_a"))?;
+    reject_identity(&rerand_a, "rerand_a")?;
 
-    let attr_s_attr: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(attr_s_attr_bytes))
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical attr_s_attr"))?;
+    let rerand_s = Option::from(Scalar::from_canonical_bytes(rerand_s_bytes))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical rerand_s"))?;
 
-    let attr_s_blind: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(attr_s_blind_bytes))
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical attr_s_blind"))?;
+    // Parse the OR-proof triples.
+    let mut or_proof: Vec<(RistrettoPoint, Scalar, Scalar)> = Vec::with_capacity(n_roles);
+    let or_base = 256;
+    for i in 0..n_roles {
+        let off = or_base + i * 96;
+        let mut a_i_b = [0u8; 32]; a_i_b.copy_from_slice(&pt[off..off + 32]);
+        let mut c_i_b = [0u8; 32]; c_i_b.copy_from_slice(&pt[off + 32..off + 64]);
+        let mut s_i_b = [0u8; 32]; s_i_b.copy_from_slice(&pt[off + 64..off + 96]);
+        let a_i = CompressedRistretto(a_i_b)
+            .decompress()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid or_proof A_i"))?;
+        let c_i = Option::from(Scalar::from_canonical_bytes(c_i_b))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical or_proof c_i"))?;
+        let s_i = Option::from(Scalar::from_canonical_bytes(s_i_b))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical or_proof s_i"))?;
+        or_proof.push((a_i, c_i, s_i));
+    }
 
     if failures.lock().unwrap().is_blocked(peer_key) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer temporarily rate limited"));
     }
 
+    // Replay cache keyed by (pid, nonce_c). Because pid already commits to
+    // (device_pub, nonce_c, eph_c, server_pub), an attacker replaying any one
+    // of those with the same session nonce collides here.
     let replay_persist_blob = {
         let mut rc = replay.lock().unwrap();
-        if !rc.check_and_insert(&device_id, &nonce_c) {
+        if !rc.check_and_insert(&pid, &nonce_c) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "replay detected",
@@ -1188,68 +1217,67 @@ fn handle_auth_v2(
         write_private_file_atomic(REPLAY_CACHE_BIN, &blob)?;
     }
 
-    // Step 4: look up the registered device key and verify the client Schnorr proof against it.
-    let record = {
+    // Resolve pid → enrolled record via an O(N) registry scan. The client
+    // never sends its device_id on the wire; the server recomputes the
+    // expected pid for each registered device_pub and matches.
+    let (_device_id, record) = {
         let reg_r = reg.read().unwrap();
-        match reg_r.get(&device_id) {
-            Some(r) => *r,
+        match lookup_record_by_pid(&reg_r, &pid, &nonce_c, &eph_c, server_static_pub) {
+            Some((id, rec)) => (id, rec),
             None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    "unknown device_id",
-                ))
+                    "unknown pid (no enrolled device produces this pseudonym)",
+                ));
             }
         }
     };
 
-    if !schnorr_verify_auth(&record.pubkey, &device_id, &a_c, &s_c, &nonce_c, &eph_c) {
+    // (1) Client possession-of-key proof, bound to pid.
+    if !schnorr_verify_auth(&record.pubkey, &pid, &a_c, &s_c, &nonce_c, &eph_c) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "client Schnorr proof invalid",
         ));
     }
 
-    if role_commitment.compress().to_bytes() != record.role_commitment.compress().to_bytes() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "role commitment mismatch",
-        ));
-    }
-
-    if !verify_role_commitment_opening(
-        &role_commitment,
-        &attr_a,
-        &attr_s_attr,
-        &attr_s_blind,
-        &device_id,
+    // (2) C' is a re-randomization of the enrolled role commitment.
+    if !verify_role_rerandomization(
+        &record.role_commitment,
+        &c_prime,
+        &rerand_a,
+        &rerand_s,
+        &pid,
         &nonce_c,
         &eph_c,
     ) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "attribute proof invalid",
+            "role re-randomization proof invalid",
         ));
     }
 
-    if record.role_code != 1u64 {
+    // (3) C' commits to a value in ALLOWED_ROLES (zero-knowledge; server does
+    // not learn which allowed role the device actually holds).
+    if !verify_role_set_membership(&c_prime, &or_proof, &pid, &nonce_c, &eph_c) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "device role not authorized",
+            "role set-membership proof invalid",
         ));
     }
 
+    // Server-side mutual authentication + session establishment.
     let nonce_s = random_bytes_32();
     let mut eph_s_secret = random_scalar();
     let eph_s = RISTRETTO_BASEPOINT_POINT * eph_s_secret;
-    // Step 5: build the server proof, derive the authenticated session key, and send the server key-confirmation tag.
     let (a_s, s_s) = schnorr_prove_server(server_static_secret, &nonce_s, &eph_s);
 
     let mut session_key = derive_session_key(
         &eph_s_secret, &eph_c, &nonce_c, &nonce_s,
-        &device_id, &eph_c, &eph_s, &x25519_shared_bytes,
+        &pid, &eph_c, &eph_s, &x25519_shared_bytes,
     );
     let th = kc_transcript_hash(
-        &device_id, &a_c, &s_c, &nonce_c, &eph_c,
+        &pid, &a_c, &s_c, &nonce_c, &eph_c,
         server_static_pub, &a_s, &s_s, &nonce_s, &eph_s,
     );
     let (k_s2c, k_c2s) = derive_kc_keys(&session_key, &th);
@@ -1272,7 +1300,7 @@ fn handle_auth_v2(
     send_all(&mut stream, &ct2, sent)?;
     stream.flush()?;
 
-    let rx_ct2 = recv_blob(&mut stream, recv, MAX_ENCRYPTED_PAYLOAD)?;
+    let rx_ct2 = recv_encrypted_blob(&mut stream, recv)?;
 
     let tag_c_plain = cipher_rx
         .decrypt(&nonce_rx_ctr.next(), rx_ct2.as_ref())
@@ -1295,10 +1323,22 @@ fn handle_auth_v2(
         ));
     }
 
+    // Log pid (not device_id) so operational logs stay unlinkable across
+    // sessions. device_id is retained internally only for registry bookkeeping.
     println!(
-        "Server[AUTH]: device_id={} KC=OK",
-        hex::encode(device_id),
+        "Server[AUTH/v2]: pid={} KC=OK",
+        hex::encode(pid),
     );
+    // Audit-only: record which device actually matched, gated behind debug
+    // builds so production logs don't leak the mapping.
+    #[cfg(debug_assertions)]
+    {
+        eprintln!(
+            "Server[AUTH/v2 DEBUG]: pid={} resolved to device_id={}",
+            hex::encode(pid),
+            hex::encode(_device_id),
+        );
+    }
 
     if let Some(blob) = replay.lock().unwrap().take_persist_blob(true) {
         write_private_file_atomic(REPLAY_CACHE_BIN, &blob)?;
@@ -1309,10 +1349,11 @@ fn handle_auth_v2(
     tx_key.zeroize();
     rx_key.zeroize();
     x25519_shared_bytes.zeroize();
-    println!("Server[ONLINE]: one-shot session completed for {}", hex::encode(device_id));
+    println!("Server[ONLINE]: one-shot v2 session completed for pid={}", hex::encode(pid));
     let _ = stream.shutdown(std::net::Shutdown::Both);
     Ok(())
 }
+
 
 /// Dispatches one inbound TCP client connection to the appropriate protocol handler.
 /// Step 1: rate-limit abusive peers, cap concurrency, and identify the requested message type.
@@ -1326,7 +1367,9 @@ fn handle_client(
     failures: Arc<Mutex<FailureTracker>>,
     _active_guard: ActiveConnGuard,
 ) {
-    let mut phase = PhaseMetrics::new();
+    let start = Instant::now();
+    let mut sent = 0usize;
+    let mut recv_bytes = 0usize;
     let peer = stream.peer_addr().ok();
     let peer_key = peer.map(|p| p.ip().to_string()).unwrap_or_else(|| "unknown".to_string());
 
@@ -1337,9 +1380,11 @@ fn handle_client(
         }};
     }
 
-    if configure_stream(&stream).is_err() { bail!("configure_stream failed"); }
+    if stream.set_nodelay(true).is_err() { bail!("set_nodelay failed"); }
+    if stream.set_read_timeout(Some(IO_TIMEOUT)).is_err() { bail!("set_read_timeout failed"); }
+    if stream.set_write_timeout(Some(IO_TIMEOUT)).is_err() { bail!("set_write_timeout failed"); }
 
-    let msg_type = match recv_u8(&mut stream, &mut phase.recv) {
+    let msg_type = match recv_u8(&mut stream, &mut recv_bytes) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("Server: read msg_type error from {:?}: {}", peer, e);
@@ -1354,14 +1399,14 @@ fn handle_client(
             &server_static_secret,
             &server_static_pub,
             &reg,
-            &mut phase.sent,
-            &mut phase.recv,
+            &mut sent,
+            &mut recv_bytes,
             &failures,
             &peer_key,
         ),
         MSG_AUTH_V2 => handle_auth_v2(
             stream, &server_static_secret, &server_static_pub,
-            &reg, &replay, &mut phase.sent, &mut phase.recv, &failures, &peer_key,
+            &reg, &replay, &mut sent, &mut recv_bytes, &failures, &peer_key,
         ),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1377,7 +1422,10 @@ fn handle_client(
         }
     }
 
-    phase.print_server(peer);
+    println!(
+        "SERVER METRICS -> {:?} Duration: {:?}, Sent: {} bytes, Received: {} bytes",
+        peer, start.elapsed(), sent, recv_bytes,
+    );
 }
 
 /// Parses CLI arguments, loads local credentials, and dispatches to setup, live authentication, offline proof, or continuity operations.
@@ -1391,9 +1439,6 @@ fn main() -> std::io::Result<()> {
     let mut pairing_token: Option<String> = None;
     let mut pairing_seconds: Option<u64> = None;
     let mut print_pubkey = false;
-    let mut verify_offline_path: Option<String> = None;
-    let mut offline_audience: Option<String> = None;
-    let mut offline_scopes: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -1415,23 +1460,8 @@ fn main() -> std::io::Result<()> {
                 i += 2;
             }
             "--print-pubkey" => { print_pubkey = true; i += 1; }
-            "--verify-offline-proof" => {
-                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--verify-offline-proof missing value")); }
-                verify_offline_path = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--audience" => {
-                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--audience missing value")); }
-                offline_audience = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--allow-offline-scope" => {
-                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--allow-offline-scope missing value")); }
-                offline_scopes.push(args[i + 1].clone());
-                i += 2;
-            }
             _ => {
-                eprintln!("Usage: {} [--bind 0.0.0.0:4000] [--pairing] [--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey] [--verify-offline-proof FILE --audience NAME --allow-offline-scope SCOPE ...]", prog);
+                eprintln!("Usage: {} [--bind 0.0.0.0:4000] [--pairing] [--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey]", prog);
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unknown argument: {}", args[i])));
             }
         }
@@ -1451,24 +1481,7 @@ fn main() -> std::io::Result<()> {
     let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
     let reg_map: HashMap<[u8; 32], DeviceRecord> = load_registry(REGISTRY_BIN).unwrap_or_default();
 
-    // Step 3: handle utility modes such as offline-proof verification or continuity-proof generation.
-    if let Some(proof_path) = verify_offline_path.as_deref() {
-        let audience = offline_audience.as_deref().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "--verify-offline-proof requires --audience")
-        })?;
-        if offline_scopes.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "--verify-offline-proof requires at least one --allow-offline-scope",
-            ));
-        }
-        let allowed_scopes: HashSet<String> = offline_scopes.into_iter().collect();
-        let mut counters = OfflineCounterStore::load(OFFLINE_COUNTERS_BIN).unwrap_or_default();
-        let reg_pub: HashMap<[u8; 32], RistrettoPoint> =
-            reg_map.iter().map(|(k, v)| (*k, v.pubkey)).collect();
-        return verify_offline_proof(proof_path, audience, &allowed_scopes, &reg_pub, &mut counters);
-    }
-    // Step 4: initialize shared server state and begin accepting TCP clients.
+    // Initialize shared server state and begin accepting TCP clients.
     let reg = Arc::new(RwLock::new(reg_map));
     let replay_state = ReplayCache::load(REPLAY_CACHE_BIN).unwrap_or_default();
     let replay = Arc::new(Mutex::new(replay_state));
