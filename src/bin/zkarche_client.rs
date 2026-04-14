@@ -9,10 +9,6 @@ use std::time::{Duration, Instant};
 
 use blake2::digest::{Update, VariableOutput};
 use blake2::{Blake2b512, Blake2bVar, Digest};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit},
-    ChaCha20Poly1305, Nonce,
-};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
@@ -21,7 +17,6 @@ use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Sha256, Sha512};
 use subtle::ConstantTimeEq;
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -58,29 +53,6 @@ const T_ROLE_RERAND: &[u8] = b"client_role_rerand_v1";
 const ALLOWED_ROLES: &[u64] = &[1u64, 2u64];
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_ENCRYPTED_PAYLOAD: usize = 4096;
-
-
-/// Tracks a monotonically increasing AEAD nonce counter so each encryption uses a unique 96-bit nonce.
-struct NonceCounter {
-    value: u64,
-}
-
-/// Tracks a monotonically increasing AEAD nonce counter so each encryption uses a unique 96-bit nonce.
-impl NonceCounter {
-    fn new() -> Self {
-        Self { value: 0 }
-    }
-
-    fn next(&mut self) -> Nonce {
-        let n = self.value;
-        self.value = self.value.checked_add(1).expect("nonce counter exhausted");
-        let mut bytes = [0u8; 12];
-        bytes[..8].copy_from_slice(&n.to_le_bytes());
-        *Nonce::from_slice(&bytes)
-    }
-}
-
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -534,8 +506,7 @@ fn schnorr_verify_server(
 }
 
 /// Derives the shared session key from the Ristretto ECDHE secret, handshake nonces,
-/// the session pseudonym `pid`, and X25519 tunnel binding. v2: binds to `pid`
-/// rather than `device_id`.
+/// and the session pseudonym `pid`. v2: binds to `pid` rather than `device_id`.
 fn derive_session_key(
     eph_secret: &Scalar,
     peer_eph_pub: &RistrettoPoint,
@@ -544,7 +515,6 @@ fn derive_session_key(
     pid: &[u8; 32],
     eph_c: &RistrettoPoint,
     eph_s: &RistrettoPoint,
-    x25519_shared: &[u8; 32],
 ) -> [u8; 32] {
     let shared = peer_eph_pub * eph_secret;
     let shared_bytes = shared.compress().to_bytes();
@@ -553,12 +523,11 @@ fn derive_session_key(
     salt[..32].copy_from_slice(nonce_c);
     salt[32..].copy_from_slice(nonce_s);
 
-    let mut info = Vec::with_capacity(14 + 32 + 32 + 32 + 32);
+    let mut info = Vec::with_capacity(14 + 32 + 32 + 32);
     info.extend_from_slice(b"session key v2");
     info.extend_from_slice(pid);
     info.extend_from_slice(eph_c.compress().as_bytes());
     info.extend_from_slice(eph_s.compress().as_bytes());
-    info.extend_from_slice(x25519_shared);
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), &shared_bytes);
     let mut okm = [0u8; 32];
@@ -634,21 +603,6 @@ fn recv_exact(stream: &mut impl Read, buf: &mut [u8], recv: &mut usize) -> std::
     Ok(())
 }
 
-/// Reads a length-prefixed ciphertext while enforcing a strict maximum payload size.
-fn recv_encrypted_blob(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    recv_exact(stream, &mut len_buf, recv)?;
-    let rx_len = u32::from_le_bytes(len_buf) as usize;
-    if rx_len > MAX_ENCRYPTED_PAYLOAD {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("payload too large: {rx_len} bytes (max {MAX_ENCRYPTED_PAYLOAD})"),
-        ));
-    }
-    let mut buf = vec![0u8; rx_len];
-    recv_exact(stream, &mut buf, recv)?;
-    Ok(buf)
-}
 
 /// Creates the parent directory for a state file when it does not already exist.
 fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
@@ -942,7 +896,7 @@ fn do_setup(
 }
 
 /// Runs the client-side ZK-ARCHE v2 authenticated session handshake. The
-/// handshake establishes an outer X25519 tunnel, derives the per-session
+/// handshake derives the per-session
 /// pseudonym pid = H(device_pub || nonce_c || eph_c || server_pub), proves
 /// possession of the registered device secret (bound to pid), re-randomizes
 /// the role commitment and proves (a) it is a re-randomization of the enrolled
@@ -967,37 +921,7 @@ fn do_auth_v2_session(server_addr: &str, _device_id: [u8; 32], mut x: Scalar) ->
 
     println!("Client[AUTH]: Connected to {}", server_addr);
 
-    // Outer X25519 tunnel.
-    let client_sk = EphemeralSecret::random_from_rng(OsRng);
-    let client_pk = X25519Public::from(&client_sk);
-
     send_all(&mut stream, &[MSG_AUTH_V2], &mut sent)?;
-    send_all(&mut stream, client_pk.as_bytes(), &mut sent)?;
-    stream.flush()?;
-
-    let mut server_pk_bytes = [0u8; 32];
-    recv_exact(&mut stream, &mut server_pk_bytes, &mut recv)?;
-    let server_pk = X25519Public::from(server_pk_bytes);
-
-    let shared_secret = client_sk.diffie_hellman(&server_pk);
-    let mut x25519_shared_bytes: [u8; 32] = *shared_secret.as_bytes();
-
-    let mut hasher = Blake2b512::new();
-    Digest::update(&mut hasher, shared_secret.as_bytes());
-    Digest::update(&mut hasher, client_pk.as_bytes());
-    Digest::update(&mut hasher, server_pk_bytes);
-    let hash = hasher.finalize();
-
-    let mut rx_key = [0u8; 32];
-    let mut tx_key = [0u8; 32];
-    rx_key.copy_from_slice(&hash[0..32]);
-    tx_key.copy_from_slice(&hash[32..64]);
-
-    let cipher_tx = ChaCha20Poly1305::new(&tx_key.into());
-    let cipher_rx = ChaCha20Poly1305::new(&rx_key.into());
-
-    let mut nonce_tx_ctr = NonceCounter::new();
-    let mut nonce_rx_ctr = NonceCounter::new();
 
     // v2 proof material.
     let device_static_pub = RISTRETTO_BASEPOINT_POINT * x;
@@ -1036,7 +960,7 @@ fn do_auth_v2_session(server_addr: &str, _device_id: [u8; 32], mut x: Scalar) ->
         &eph_pub,
     );
 
-    // Wire format:
+    // Wire format (plaintext on the wire after removing the outer X25519 tunnel):
     //   pid(32) | a_c(32) | s_c(32) | nonce_c(32) | eph_c(32) |
     //   c_prime(32) | rerand_a(32) | rerand_s(32) |
     //   [ A_i(32) | c_i(32) | s_i(32) ]  * n
@@ -1056,26 +980,12 @@ fn do_auth_v2_session(server_addr: &str, _device_id: [u8; 32], mut x: Scalar) ->
         payload1.extend_from_slice(&s_i.to_bytes());
     }
 
-    let ct1 = cipher_tx
-        .encrypt(&nonce_tx_ctr.next(), payload1.as_ref())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "encryption failed"))?;
-
-    send_blob(&mut stream, &ct1, &mut sent)?;
+    send_all(&mut stream, &payload1, &mut sent)?;
     stream.flush()?;
 
     // Server response: pubkey || a_s || s_s || nonce_s || eph_s || tag_s  (192 bytes)
-    let rx_ct = recv_encrypted_blob(&mut stream, &mut recv)?;
-
-    let pt2 = cipher_rx
-        .decrypt(&nonce_rx_ctr.next(), rx_ct.as_ref())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "decryption failed"))?;
-
-    if pt2.len() != 192 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid server payload length: {} (expected 192)", pt2.len()),
-        ));
-    }
+    let mut pt2 = [0u8; 192];
+    recv_exact(&mut stream, &mut pt2, &mut recv)?;
 
     let mut s_pub_bytes = [0u8; 32];
     s_pub_bytes.copy_from_slice(&pt2[0..32]);
@@ -1120,7 +1030,15 @@ fn do_auth_v2_session(server_addr: &str, _device_id: [u8; 32], mut x: Scalar) ->
     }
     println!("Client[AUTH]: Server Schnorr proof OK");
 
-    let mut session_key = derive_session_key(&eph_secret, &eph_s, &nonce_c, &nonce_s, &pid, &eph_pub, &eph_s, &x25519_shared_bytes);
+    let mut session_key = derive_session_key(
+        &eph_secret,
+        &eph_s,
+        &nonce_c,
+        &nonce_s,
+        &pid,
+        &eph_pub,
+        &eph_s,
+    );
     let th = kc_transcript_hash(&pid, &a_c, &s_c, &nonce_c, &eph_pub, &server_static_pub, &a_s, &s_s, &nonce_s, &eph_s);
     let (k_s2c, k_c2s) = derive_kc_keys(&session_key, &th);
 
@@ -1135,19 +1053,12 @@ fn do_auth_v2_session(server_addr: &str, _device_id: [u8; 32], mut x: Scalar) ->
 
     let tag_c = hmac_tag(&k_c2s, b"client finished", &th);
 
-    let ct3 = cipher_tx
-        .encrypt(&nonce_tx_ctr.next(), tag_c.as_ref())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "encryption failed"))?;
-
-    send_blob(&mut stream, &ct3, &mut sent)?;
+    send_all(&mut stream, &tag_c, &mut sent)?;
     stream.flush()?;
 
     println!("Client[AUTH]: Sent encrypted client finished tag");
 
     session_key.zeroize();
-    x25519_shared_bytes.zeroize();
-    tx_key.zeroize();
-    rx_key.zeroize();
     x.zeroize();
     eph_secret.zeroize();
 
