@@ -1,49 +1,104 @@
-# ZK comparative baselines: mTLS and EDHOC-over-TCP (Rust)
+# ZK-ARCHE Comparative Authentication Evaluation
 
-This folder gives you two baseline protocol pairs for your comparative section:
+This repository combines the Rust implementations, benchmark harnesses, Mininet
+network simulations, and hardware resource-measurement tools needed to evaluate
+ZK-ARCHE against EDHOC and mTLS for IoT authentication.
 
-- `mtls_server` / `mtls_client`
-- `edhoc_server` / `edhoc_client`
+## Protocols included
 
-## What is fully runnable right now
+- **ZK-ARCHE**: privacy-preserving zero-knowledge authentication prototype.
+- **EDHOC-over-TCP**: lightweight constrained-device authentication baseline.
+- **mTLS**: certificate-based mutual TLS baseline.
 
-### mTLS
-The mTLS pair is intended to be runnable as-is after you generate local certificates.
+All protocol binaries emit a shared metrics line:
 
-Generate certificates:
-
-```bash
-bash scripts/gen_certs.sh
+```text
+CLIENT METRICS -> Duration: ..., Sent: ... bytes, Received: ... bytes
 ```
 
-Run:
+The Python harnesses parse that line to generate latency and communication
+results.
 
-```bash
-cargo run --bin mtls_server
-cargo run --bin mtls_client
+## Repository layout
+
+```text
+src/bin/                 Rust server/client binaries for ZK-ARCHE, EDHOC, mTLS
+src/common/              Shared Rust helpers for metrics, framing, certs, I/O
+scripts/gen_certs.sh     Local CA/server/client certificate generation for mTLS
+benchmarks/              LAN benchmark harness and graph/table generator
+experiments/mininet/     50-client randomized IoT Mininet experiments
+experiments/hardware/    Actual-hardware CPU/RAM/power benchmark wrapper
+docs/                    Methodology and experiment runbooks
 ```
 
-## EDHOC-over-TCP
-The EDHOC pair is adapted from the official `lakers` example flow, but uses a simple length-prefixed TCP framing instead of CoAP.
+## One-time setup
 
-Run:
+Install Rust and Python dependencies, then build the binaries:
 
 ```bash
-cargo run --bin edhoc_server
-cargo run --bin edhoc_client
+python3 -m pip install -r requirements.txt
+bash benchmarks/setup.sh
 ```
 
-## Important note
-The EDHOC files are based on the official `lakers` example credentials and state-machine flow. If the exact `lakers` crate API changes across releases, you may need small import or type adjustments.
+Or use the Makefile:
 
-## Design notes
-- mTLS uses `rustls` + `tokio-rustls`.
-- EDHOC uses `lakers` + `lakers-crypto` with the RustCrypto backend.
-- Both models emit JSON metrics to standard output.
+```bash
+make setup
+```
 
-## Files
-- `src/common/metrics.rs`: shared metrics struct
-- `src/common/framing.rs`: TCP length framing for EDHOC/TCP
-- `src/common/certs.rs`: PEM certificate/key loading helpers
-- `src/bin/mtls_*.rs`: mTLS server/client
-- `src/bin/edhoc_*.rs`: EDHOC-over-TCP server/client
+## Run the local benchmark suite
+
+```bash
+bash benchmarks/run_all.sh
+python3 -m benchmarks.plot
+```
+
+This produces raw CSV/JSON under `benchmarks/results/` and LaTeX PGFPlots files
+under `benchmarks/graphs_tex/`.
+
+## Run Mininet IoT simulations
+
+Each simulation creates one i7-class server and randomized Raspberry Pi-class
+clients. The output CSV includes `client_type` for every run.
+
+```bash
+sudo python3 experiments/mininet/zkarche_mininet_50_iot.py --project . --seed 42
+sudo python3 experiments/mininet/mtls_mininet_50_iot.py    --project . --seed 42
+sudo python3 experiments/mininet/edhoc_mininet_50_iot.py   --project . --seed 42
+```
+
+See `docs/MININET_EXPERIMENTS.md` for details.
+
+## Run actual hardware resource tests
+
+Run this on the physical device you want to measure:
+
+```bash
+python3 experiments/hardware/hardware_resource_benchmark.py \
+  --protocol zkarche \
+  --role client \
+  --device "Raspberry Pi 4" \
+  --server "Core i7-6770HQ 2.60GHz" \
+  --runs 50 \
+  --cmd './target/release/zkarche_client --server 192.168.1.10:4000' \
+  --power-mode fixed \
+  --fixed-power-watts 3.2
+```
+
+See `docs/HARDWARE_BENCHMARKING.md` for hwmon power-sensor examples.
+
+## Recommended workflow for the thesis
+
+1. Use actual Raspberry Pi hardware for CPU, RAM, and power claims.
+2. Use Mininet for randomized 50-client network-latency scenarios.
+3. Use `benchmarks/plot.py` to convert CSV/JSON results into PGFPlots files.
+4. Clearly separate measured hardware power from fixed-power energy estimates.
+
+## Notes
+
+- Mininet does not emulate Raspberry Pi CPU performance. It emulates network
+  behavior such as delay, jitter, bandwidth, and packet loss.
+- mTLS requires generated certificates. `benchmarks/setup.sh` and the mTLS
+  Mininet runner generate them if missing.
+- ZK-ARCHE clients use separate working directories in multi-client experiments
+  so each simulated device has independent state.

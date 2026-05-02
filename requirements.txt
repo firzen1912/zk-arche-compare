@@ -1,0 +1,8 @@
+# Core Python dependencies for plotting/resource tools.
+psutil>=5.9
+matplotlib>=3.7
+
+# System-level dependencies not installable via pip:
+# - Rust toolchain/cargo
+# - OpenSSL CLI for scripts/gen_certs.sh
+# - Mininet for experiments/mininet/*.py
