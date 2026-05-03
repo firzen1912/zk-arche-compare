@@ -4,6 +4,25 @@ This repository combines the Rust implementations, benchmark harnesses, Mininet
 network simulations, and hardware resource-measurement tools needed to evaluate
 ZK-ARCHE against EDHOC and mTLS for IoT authentication.
 
+
+## Security Testing
+
+The repo now includes a dedicated security suite covering transcript binding, message mutation, invalid curve/small-subgroup rejection, DoS resilience, nonce/session uniqueness, packet-parser fuzzing, replay-cache behavior, and side-channel/RNG checks. See [`docs/SECURITY_TESTS.md`](docs/SECURITY_TESTS.md).
+
+Quick start:
+
+```bash
+make security-test
+make security-check
+```
+
+For packet fuzzing:
+
+```bash
+cargo install cargo-fuzz
+make fuzz-packet
+```
+
 ## Protocols included
 
 - **ZK-ARCHE**: privacy-preserving zero-knowledge authentication prototype.
@@ -102,3 +121,21 @@ See `docs/HARDWARE_BENCHMARKING.md` for hwmon power-sensor examples.
   Mininet runner generate them if missing.
 - ZK-ARCHE clients use separate working directories in multi-client experiments
   so each simulated device has independent state.
+## Security tests
+
+The security test suite is organized under `security/`. Each test has its own script, and both Bash and PowerShell launchers can run one test or the safe regression subset while saving per-test logs.
+
+```bash
+bash security/run_security_tests.sh --test all
+bash security/run_security_tests.sh --test transcript
+bash security/run_security_tests.sh --test fuzz --fuzz-seconds 300
+bash security/run_security_tests.sh --test dos --protocol zkarche --port 4000
+```
+
+PowerShell is also supported:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File security/run_security_tests.ps1 -Test all
+```
+
+See `docs/SECURITY_TESTS.md` for the full list of the eight security tests and their output logs.

@@ -1,0 +1,19 @@
+[package]
+name = "zk-compare-models-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+curve25519-dalek = "4"
+
+[[bin]]
+name = "packet_parsers"
+path = "fuzz_targets/packet_parsers.rs"
+test = false
+doc = false
+bench = false

@@ -14,3 +14,8 @@ benchmarks/results/
 benchmarks/graphs_tex/
 benchmarks/plots/
 /tmp/
+
+# Security test outputs
+results/security/
+fuzz/artifacts/
+fuzz/corpus/
