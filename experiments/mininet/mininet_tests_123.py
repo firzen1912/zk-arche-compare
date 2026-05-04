@@ -741,6 +741,16 @@ def prepare_zkarche_state(server_bin: str, client_bin: str, protocol_workdir: Pa
 
     Setup metrics are stored on each assignment so every later auth row can
     include full_session_duration_ms = setup_duration_ms + auth_duration_ms.
+
+    Server-side setup metrics are also captured from the ZK-ARCHE server log
+    and stored on each assignment as server_setup_duration_ms,
+    server_setup_sent_bytes, and server_setup_received_bytes.
+
+    Later, add_zkarche_server_full_session_fields() uses those values to compute:
+
+        server_full_session_duration_ms =
+            server_setup_duration_ms + server_auth_duration_ms
+
     The server-public-key pinning step is treated as out-of-band provisioning
     and is not included in setup_duration_ms.
     """
@@ -748,6 +758,10 @@ def prepare_zkarche_state(server_bin: str, client_bin: str, protocol_workdir: Pa
     server_pub = run_local(f"{shlex.quote(server_bin)} --print-pubkey", cwd=server_dir).splitlines()[-1].strip()
     if not re.fullmatch(r"[0-9a-fA-F]{64}", server_pub):
         raise RuntimeError(f"Could not parse ZK-ARCHE server public key: {server_pub}")
+
+    setup_log_path = "/tmp/zkarche_tests123_server.log"
+    setup_log_before = server.cmd(f"cat {shlex.quote(setup_log_path)} 2>/dev/null || true")
+    setup_start_line = len((setup_log_before or "").splitlines())
 
     for idx, client in enumerate(clients):
         cdir = assignments[idx]["client_workdir"]
@@ -773,35 +787,49 @@ def prepare_zkarche_state(server_bin: str, client_bin: str, protocol_workdir: Pa
         assignments[idx]["setup_received_bytes"] = setup_metrics.get("auth_received_bytes")
         assignments[idx]["setup_wall_elapsed_ms"] = setup_wall_ms
 
-        # Capture the server-side setup metric for the same enrollment. Setup
-        # runs sequentially here, so the latest SERVER METRICS line belongs to
-        # this client setup exchange.
-        time.sleep(0.1)
-        setup_log = server.cmd("cat /tmp/zkarche_tests123_server.log 2>/dev/null || true")
-        setup_server_rows, _ = parse_server_metrics_log(
-            protocol="zkarche",
-            log_text=setup_log,
-            start_line=0,
-            test_id="setup",
-            workload="setup",
-            round_index=0,
-        )
-        if setup_server_rows:
-            sr = setup_server_rows[-1]
-            assignments[idx]["server_setup_duration_ms"] = sr.get("server_auth_duration_ms")
-            assignments[idx]["server_setup_sent_bytes"] = sr.get("server_sent_bytes")
-            assignments[idx]["server_setup_received_bytes"] = sr.get("server_received_bytes")
-        else:
-            assignments[idx]["server_setup_duration_ms"] = None
-            assignments[idx]["server_setup_sent_bytes"] = None
-            assignments[idx]["server_setup_received_bytes"] = None
+        assignments[idx]["server_setup_duration_ms"] = None
+        assignments[idx]["server_setup_sent_bytes"] = None
+        assignments[idx]["server_setup_received_bytes"] = None
 
         print(
             f"ZK-ARCHE setup | {client.name:>4} | {assignments[idx]['client_type']:<17} | "
             f"client_setup={assignments[idx]['setup_duration_ms']} ms | "
-            f"server_setup={assignments[idx]['server_setup_duration_ms']} ms | "
             f"sent={assignments[idx]['setup_sent_bytes']} B | recv={assignments[idx]['setup_received_bytes']} B"
         )
+
+    setup_rows = []
+    expected = len(clients)
+    for _ in range(20):  # up to about 2 seconds for redirected stdout to flush
+        time.sleep(0.1)
+        setup_log_after = server.cmd(f"cat {shlex.quote(setup_log_path)} 2>/dev/null || true")
+        setup_rows, _ = parse_server_metrics_log(
+            protocol="zkarche",
+            log_text=setup_log_after,
+            start_line=setup_start_line,
+            test_id="setup",
+            workload="setup",
+            round_index=0,
+        )
+        if len(setup_rows) >= expected:
+            break
+
+    by_ip = {a["client_ip"]: a for a in assignments}
+    for sr in setup_rows:
+        peer = str(sr.get("server_peer") or "")
+        ip = peer.split(":", 1)[0].strip().strip('"')
+        a = by_ip.get(ip)
+        if not a:
+            continue
+        a["server_setup_duration_ms"] = sr.get("server_auth_duration_ms")
+        a["server_setup_sent_bytes"] = sr.get("server_sent_bytes")
+        a["server_setup_received_bytes"] = sr.get("server_received_bytes")
+
+    found = sum(1 for a in assignments if a.get("server_setup_duration_ms") is not None)
+    print(f"ZK-ARCHE server setup metrics captured: {found}/{expected}")
+    if found < expected:
+        missing = [a["client_host"] for a in assignments if a.get("server_setup_duration_ms") is None]
+        print(f"WARNING: missing server setup metrics for: {', '.join(missing[:10])}" + (" ..." if len(missing) > 10 else ""))
+
 
 def client_auth_cmd(protocol: str, client_bin: str, client_workdir: str) -> str:
     cfg = PROTOCOLS[protocol]
