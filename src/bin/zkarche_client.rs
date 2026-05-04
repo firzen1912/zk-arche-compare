@@ -6,6 +6,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::net::TcpStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use std::sync::OnceLock;
 
 use blake2::digest::{Update, VariableOutput};
 use blake2::{Blake2b512, Blake2bVar, Digest};
@@ -26,11 +27,15 @@ const SETUP_CHALLENGE_LEN: usize = 16;
 
 const MSG_SETUP: u8 = 0x01;
 const MSG_AUTH_V2: u8 = 0x03;
+const MSG_AUTH_V3: u8 = 0x04;
+const AUTH_FLAG_DEVICE_ONLY: u8 = 0x01;
+const AUTH_FLAG_HANDLE_LOOKUP: u8 = 0x02;
 #[allow(dead_code)]
 const MSG_GOODBYE: u8 = 0x15;
 
 const DEVICE_ROOT_FILE: &str = "state/client/device_root.bin";
 const SERVER_PUB_FILE: &str = "state/client/server_pub.bin";
+const DEVICE_PUB_FILE: &str = "state/client/device_pub.bin";
 const ROLE_CRED_FILE: &str = "state/client/role_cred.bin";
 
 // Enrollment (setup) domain separators — unchanged from v1; setup is when the
@@ -156,8 +161,32 @@ fn hash_to_point(label: &[u8]) -> RistrettoPoint {
     RistrettoPoint::from_uniform_bytes(&wide)
 }
 
+static ATTR_H: OnceLock<RistrettoPoint> = OnceLock::new();
+
 fn attr_h() -> RistrettoPoint {
-    hash_to_point(b"iot-auth/attr-h/v1")
+    ATTR_H.get_or_init(|| hash_to_point(b"iot-auth/attr-h/v1")).clone()
+}
+
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+        .unwrap_or(false)
+}
+
+fn bench_log(label: &str, elapsed: Duration) {
+    if env_truthy("ZKARCHE_BENCH_MODE") {
+        eprintln!("BENCH client_{}_us={}", label, elapsed.as_micros());
+    }
+}
+
+fn compute_device_handle(device_pub: &RistrettoPoint) -> [u8; 16] {
+    let mut h = Sha256::new();
+    sha2::Digest::update(&mut h, b"zkarche/device-handle/v1");
+    sha2::Digest::update(&mut h, device_pub.compress().as_bytes());
+    let out = h.finalize();
+    let mut handle = [0u8; 16];
+    handle.copy_from_slice(&out[..16]);
+    handle
 }
 
 fn encode_role(role_code: u64) -> Scalar {
@@ -754,6 +783,38 @@ fn save_server_pub(pubkey: &RistrettoPoint) -> std::io::Result<()> {
     write_private_file_atomic(SERVER_PUB_FILE, pubkey.compress().as_bytes())
 }
 
+fn save_device_pub(pubkey: &RistrettoPoint) -> std::io::Result<()> {
+    write_private_file_atomic(DEVICE_PUB_FILE, pubkey.compress().as_bytes())
+}
+
+fn load_cached_device_pub() -> std::io::Result<Option<RistrettoPoint>> {
+    if !Path::new(DEVICE_PUB_FILE).exists() {
+        return Ok(None);
+    }
+    verify_private_file_permissions(DEVICE_PUB_FILE)?;
+    let b = fs::read(DEVICE_PUB_FILE)?;
+    if b.len() != 32 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "device_pub.bin wrong length"));
+    }
+    let mut bb = [0u8; 32];
+    bb.copy_from_slice(&b);
+    let p = CompressedRistretto(bb)
+        .decompress()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "cached device_pub invalid"))?;
+    reject_identity(&p, "cached device_pub")?;
+    Ok(Some(p))
+}
+
+fn load_or_compute_device_pub(x: &Scalar) -> std::io::Result<RistrettoPoint> {
+    if let Some(p) = load_cached_device_pub()? {
+        return Ok(p);
+    }
+    let p = RISTRETTO_BASEPOINT_POINT * x;
+    reject_identity(&p, "device_static_pub")?;
+    save_device_pub(&p)?;
+    Ok(p)
+}
+
 /// Runs the client-side raw-public-key setup flow and pins the server static key.
 fn do_setup(
     server_addr: &str,
@@ -766,7 +827,7 @@ fn do_setup(
     let mut sent = 0usize;
     let mut recv = 0usize;
 
-    let device_static_pub = RISTRETTO_BASEPOINT_POINT * x;
+    let device_static_pub = load_or_compute_device_pub(&x)?;
     reject_identity(&device_static_pub, "client device_static_pub")?;
     let device_pub_bytes = device_static_pub.compress().to_bytes();
     let role_cred = load_or_create_role_credential()?;
@@ -921,71 +982,95 @@ fn do_auth_v2_session(server_addr: &str, _device_id: [u8; 32], mut x: Scalar) ->
 
     println!("Client[AUTH]: Connected to {}", server_addr);
 
-    send_all(&mut stream, &[MSG_AUTH_V2], &mut sent)?;
+    let fast_lookup = env_truthy("ZKARCHE_FAST_LOOKUP");
+    let device_only = env_truthy("ZKARCHE_DEVICE_ONLY");
+    if fast_lookup || device_only {
+        send_all(&mut stream, &[MSG_AUTH_V3], &mut sent)?;
+        let mut flags = 0u8;
+        if device_only { flags |= AUTH_FLAG_DEVICE_ONLY; }
+        if fast_lookup { flags |= AUTH_FLAG_HANDLE_LOOKUP; }
+        send_all(&mut stream, &[flags], &mut sent)?;
+    } else {
+        send_all(&mut stream, &[MSG_AUTH_V2], &mut sent)?;
+    }
 
-    // v2 proof material.
-    let device_static_pub = RISTRETTO_BASEPOINT_POINT * x;
+    let t = Instant::now();
+    let device_static_pub = load_or_compute_device_pub(&x)?;
     reject_identity(&device_static_pub, "device_static_pub")?;
+    bench_log("load_or_compute_device_pub", t.elapsed());
 
+    if fast_lookup {
+        let handle = compute_device_handle(&device_static_pub);
+        send_all(&mut stream, &handle, &mut sent)?;
+    }
+
+    let t = Instant::now();
     let mut nonce_c = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_c);
-
     let mut eph_secret = random_scalar();
     let eph_pub = RISTRETTO_BASEPOINT_POINT * eph_secret;
-
-    // Derive the session pseudonym. All subsequent transcripts bind to pid,
-    // not the stable device identifier.
     let pid = compute_pid(&device_static_pub, &nonce_c, &eph_pub, &pinned_server_pub);
+    bench_log("nonce_eph_pid", t.elapsed());
 
-    // Client identity Schnorr proof bound to pid.
+    let t = Instant::now();
     let (a_c, s_c) = schnorr_prove_auth(&x, &pid, &nonce_c, &eph_pub);
+    bench_log("schnorr_prove_auth", t.elapsed());
 
-    // Role set-membership proof with per-session re-randomization.
-    let role_cred = load_or_create_role_credential()?;
-    let (c_prime, blind_prime, delta) = rerandomize_role_commitment(&role_cred);
-    let (rerand_a, rerand_s) = prove_role_rerandomization(
-        &role_cred.commitment,
-        &c_prime,
-        &delta,
-        &pid,
-        &nonce_c,
-        &eph_pub,
-    );
-    let or_proof = prove_role_set_membership(
-        &c_prime,
-        role_cred.role_code,
-        &blind_prime,
-        &pid,
-        &nonce_c,
-        &eph_pub,
-    );
-
-    // Wire format (plaintext on the wire after removing the outer X25519 tunnel):
-    //   pid(32) | a_c(32) | s_c(32) | nonce_c(32) | eph_c(32) |
-    //   c_prime(32) | rerand_a(32) | rerand_s(32) |
-    //   [ A_i(32) | c_i(32) | s_i(32) ]  * n
-    let n = ALLOWED_ROLES.len();
-    let mut payload1 = Vec::with_capacity(256 + 96 * n);
+    let mut payload1 = Vec::with_capacity(if device_only { 160 } else { 256 + 96 * ALLOWED_ROLES.len() });
     payload1.extend_from_slice(&pid);
     payload1.extend_from_slice(a_c.compress().as_bytes());
     payload1.extend_from_slice(&s_c.to_bytes());
     payload1.extend_from_slice(&nonce_c);
     payload1.extend_from_slice(eph_pub.compress().as_bytes());
-    payload1.extend_from_slice(c_prime.compress().as_bytes());
-    payload1.extend_from_slice(rerand_a.compress().as_bytes());
-    payload1.extend_from_slice(&rerand_s.to_bytes());
-    for (a_i, c_i, s_i) in &or_proof {
-        payload1.extend_from_slice(a_i.compress().as_bytes());
-        payload1.extend_from_slice(&c_i.to_bytes());
-        payload1.extend_from_slice(&s_i.to_bytes());
+
+    if !device_only {
+        let t = Instant::now();
+        let role_cred = load_or_create_role_credential()?;
+        bench_log("load_role_credential", t.elapsed());
+
+        let t = Instant::now();
+        let (c_prime, blind_prime, delta) = rerandomize_role_commitment(&role_cred);
+        let (rerand_a, rerand_s) = prove_role_rerandomization(
+            &role_cred.commitment,
+            &c_prime,
+            &delta,
+            &pid,
+            &nonce_c,
+            &eph_pub,
+        );
+        bench_log("role_rerand_proof", t.elapsed());
+
+        let t = Instant::now();
+        let or_proof = prove_role_set_membership(
+            &c_prime,
+            role_cred.role_code,
+            &blind_prime,
+            &pid,
+            &nonce_c,
+            &eph_pub,
+        );
+        bench_log("role_set_membership_proof", t.elapsed());
+
+        payload1.extend_from_slice(c_prime.compress().as_bytes());
+        payload1.extend_from_slice(rerand_a.compress().as_bytes());
+        payload1.extend_from_slice(&rerand_s.to_bytes());
+        for (a_i, c_i, s_i) in &or_proof {
+            payload1.extend_from_slice(a_i.compress().as_bytes());
+            payload1.extend_from_slice(&c_i.to_bytes());
+            payload1.extend_from_slice(&s_i.to_bytes());
+        }
     }
 
+    let t = Instant::now();
     send_all(&mut stream, &payload1, &mut sent)?;
     stream.flush()?;
+    bench_log("send_auth_payload", t.elapsed());
 
     // Server response: pubkey || a_s || s_s || nonce_s || eph_s || tag_s  (192 bytes)
+    let t = Instant::now();
     let mut pt2 = [0u8; 192];
     recv_exact(&mut stream, &mut pt2, &mut recv)?;
+    bench_log("wait_server_response", t.elapsed());
 
     let mut s_pub_bytes = [0u8; 32];
     s_pub_bytes.copy_from_slice(&pt2[0..32]);
@@ -1022,14 +1107,17 @@ fn do_auth_v2_session(server_addr: &str, _device_id: [u8; 32], mut x: Scalar) ->
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Server pubkey mismatch — possible MITM"));
     }
 
+    let t = Instant::now();
     if !schnorr_verify_server(&server_static_pub, &a_s, &s_s, &nonce_s, &eph_s) {
         eprintln!("Client[AUTH]: Server Schnorr proof FAILED");
         x.zeroize();
         eph_secret.zeroize();
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server Schnorr proof invalid"));
     }
+    bench_log("verify_server_schnorr", t.elapsed());
     println!("Client[AUTH]: Server Schnorr proof OK");
 
+    let t = Instant::now();
     let mut session_key = derive_session_key(
         &eph_secret,
         &eph_s,
@@ -1043,6 +1131,7 @@ fn do_auth_v2_session(server_addr: &str, _device_id: [u8; 32], mut x: Scalar) ->
     let (k_s2c, k_c2s) = derive_kc_keys(&session_key, &th);
 
     let expected_tag_s = hmac_tag(&k_s2c, b"server finished", &th);
+    bench_log("derive_session_and_kc", t.elapsed());
 
     if expected_tag_s.ct_eq(&tag_s).unwrap_u8() == 0 {
         x.zeroize();
@@ -1083,7 +1172,8 @@ fn usage(prog: &str) {
     eprintln!(
         "Usage:
   {0} --server 127.0.0.1:4000 --setup [--pairing-token TOKEN] [--allow-tofu-setup (debug-only)]
-  {0} --server 127.0.0.1:4000
+  {0} --server 127.0.0.1:4000 [--repeat N]
+     env options: ZKARCHE_FAST_LOOKUP=1 ZKARCHE_DEVICE_ONLY=1 ZKARCHE_BENCH_MODE=1
   {0} --pin-server-pub <hex>
   {0} --print-device-identity",
         prog
@@ -1124,6 +1214,7 @@ fn main() -> std::io::Result<()> {
     let mut pairing_token: Option<String> = None;
     let mut print_identity = false;
     let mut allow_tofu_setup = false;
+    let mut repeat_count: usize = 1;
 
     let mut i = 1;
     while i < args.len() {
@@ -1145,6 +1236,12 @@ fn main() -> std::io::Result<()> {
             "--pairing-token" => {
                 if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--pairing-token missing value")); }
                 pairing_token = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--repeat" => {
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--repeat missing value")); }
+                repeat_count = args[i + 1].parse::<usize>().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --repeat value"))?;
+                if repeat_count == 0 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--repeat must be >= 1")); }
                 i += 2;
             }
             "--pin-server-pub" => {
@@ -1183,6 +1280,12 @@ fn main() -> std::io::Result<()> {
         println!("Client[SETUP]: {}", if had_root_before { "Using existing device root for setup (idempotent)." } else { "No device root found; generating NEW device root." });
         do_setup(&server_addr, device_id, x, pairing_token.as_deref(), allow_tofu_setup)
     } else {
-        do_auth_v2(&server_addr, device_id, x)
+        for iter in 1..=repeat_count {
+            if repeat_count > 1 {
+                eprintln!("BENCH client_repeat_iteration={}", iter);
+            }
+            do_auth_v2(&server_addr, device_id, x.clone())?;
+        }
+        Ok(())
     }
 }

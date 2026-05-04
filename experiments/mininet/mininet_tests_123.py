@@ -79,6 +79,69 @@ DEVICE_PROFILES = {
     },
 }
 
+
+# Optional heterogeneous IoT device mix used by --device-mix heterogeneous-iot.
+# Bandwidth values model access-link constraints; CPU is still the host CPU unless
+# you add cgroup/CPU-limited Mininet hosts later.
+HETEROGENEOUS_IOT_PROFILES = {
+    "ESP32 sensor": {
+        "weight": 0.24,
+        "bw_mbps": 10,
+        "delay_ms_range": (25, 95),
+        "jitter_ms_range": (4, 18),
+        "loss_percent_range": (0.2, 3.0),
+        "traffic_role": "telemetry",
+    },
+    "Raspberry Pi 3B+": {
+        "weight": 0.22,
+        "bw_mbps": 100,
+        "delay_ms_range": (12, 45),
+        "jitter_ms_range": (2, 8),
+        "loss_percent_range": (0.0, 1.5),
+        "traffic_role": "edge_node",
+    },
+    "Raspberry Pi 4": {
+        "weight": 0.20,
+        "bw_mbps": 100,
+        "delay_ms_range": (8, 32),
+        "jitter_ms_range": (1, 6),
+        "loss_percent_range": (0.0, 1.0),
+        "traffic_role": "edge_node",
+    },
+    "Smart camera": {
+        "weight": 0.14,
+        "bw_mbps": 25,
+        "delay_ms_range": (10, 40),
+        "jitter_ms_range": (2, 12),
+        "loss_percent_range": (0.0, 2.0),
+        "traffic_role": "video",
+    },
+    "Smart meter": {
+        "weight": 0.12,
+        "bw_mbps": 5,
+        "delay_ms_range": (35, 120),
+        "jitter_ms_range": (6, 25),
+        "loss_percent_range": (0.2, 4.0),
+        "traffic_role": "low_rate",
+    },
+    "Industrial gateway": {
+        "weight": 0.08,
+        "bw_mbps": 100,
+        "delay_ms_range": (5, 25),
+        "jitter_ms_range": (1, 5),
+        "loss_percent_range": (0.0, 0.8),
+        "traffic_role": "gateway",
+    },
+}
+
+BACKGROUND_TRAFFIC_PROFILES = {
+    "none": {"ping": 0, "tcp": 0, "udp": 0, "udp_rate": "0M"},
+    "light": {"ping": 4, "tcp": 1, "udp": 1, "udp_rate": "1M"},
+    "medium": {"ping": 8, "tcp": 2, "udp": 2, "udp_rate": "3M"},
+    "heavy": {"ping": 12, "tcp": 4, "udp": 4, "udp_rate": "8M"},
+    "burst": {"ping": 12, "tcp": 2, "udp": 6, "udp_rate": "15M"},
+}
+
 PROTOCOLS = {
     "zkarche": {
         "server_bin": "zkarche_server",
@@ -148,9 +211,16 @@ def prepare_mtls_authorized_clients(project_root: Path, protocol_workdir: Path) 
     return fp
 
 
-def weighted_random_device() -> str:
-    names = list(DEVICE_PROFILES.keys())
-    weights = [DEVICE_PROFILES[name]["weight"] for name in names]
+def selected_device_profiles(device_mix: str) -> Dict:
+    if device_mix == "heterogeneous-iot":
+        return HETEROGENEOUS_IOT_PROFILES
+    return DEVICE_PROFILES
+
+
+def weighted_random_device(device_mix: str = "raspberry-pi") -> str:
+    profiles = selected_device_profiles(device_mix)
+    names = list(profiles.keys())
+    weights = [profiles[name]["weight"] for name in names]
     return random.choices(names, weights=weights, k=1)[0]
 
 
@@ -224,6 +294,125 @@ def parse_client_metrics(output: str) -> Dict[str, Optional[float]]:
     return metrics
 
 
+def parse_all_client_metrics(output: str) -> List[Dict[str, Optional[float]]]:
+    metrics_list = []
+    current_lines = []
+    for line in output.splitlines():
+        if "CLIENT METRICS ->" in line:
+            m = parse_client_metrics(line)
+            if m["auth_duration_ms"] is not None:
+                metrics_list.append(m)
+    return metrics_list
+
+
+
+def empty_server_metric_row(protocol: str, test_id: str, workload: str, round_index: int) -> Dict[str, Optional[float]]:
+    return {
+        "protocol": protocol,
+        "test_id": test_id,
+        "workload": workload,
+        "round_index": round_index,
+        "server_peer": None,
+        "server_auth_duration_ms": None,
+        "server_sent_bytes": None,
+        "server_received_bytes": None,
+        "server_device_id": None,
+        "server_client_cert_sha256": None,
+        "server_request_bytes": None,
+        "server_response_bytes": None,
+        "server_payload_bytes": None,
+        "server_timestamp_ms": None,
+        "server_status": "SERVER_METRIC",
+        "server_stdout_tail": None,
+    }
+
+
+def parse_server_metrics_line(protocol: str, line: str, test_id: str, workload: str, round_index: int) -> Optional[Dict[str, Optional[float]]]:
+    """
+    Supports original and upgraded server metric lines, for example:
+      SERVER METRICS -> 10.0.0.2:1234 Duration: 5.123ms, Sent: 100 bytes, Received: 200 bytes
+      SERVER METRICS -> Peer: 10.0.0.2:1234, Protocol: mTLS/TCP, Duration: 5.123ms, Sent: 100 bytes, Received: 200 bytes, ...
+      SERVER METRICS -> Peer: 10.0.0.2:1234, Protocol: EDHOC/TCP, Duration: 5.123ms, Sent: 100 bytes, Received: 200 bytes, ...
+    """
+    if "SERVER METRICS ->" not in line:
+        return None
+
+    row = empty_server_metric_row(protocol, test_id, workload, round_index)
+
+    # Upgraded mTLS / EDHOC format.
+    m = re.search(
+        r"SERVER METRICS\s*->\s*Peer:\s*([^,]+),\s*Protocol:\s*[^,]+,\s*"
+        r"Duration:\s*([^,]+),\s*Sent:\s*(\d+)\s*bytes,\s*Received:\s*(\d+)\s*bytes",
+        line,
+    )
+
+    # Original compact ZK-ARCHE / EDHOC format.
+    if not m:
+        m = re.search(
+            r"SERVER METRICS\s*->\s*([^,]+?)\s+Duration:\s*([^,]+),\s*"
+            r"Sent:\s*(\d+)\s*bytes,\s*Received:\s*(\d+)\s*bytes",
+            line,
+        )
+
+    if not m:
+        return None
+
+    row["server_peer"] = m.group(1).strip().strip('"')
+    parsed = parse_duration_to_ms(m.group(2))
+    row["server_auth_duration_ms"] = round(parsed, 4) if parsed is not None else None
+    row["server_sent_bytes"] = int(m.group(3))
+    row["server_received_bytes"] = int(m.group(4))
+
+    optional_fields = [
+        ("DeviceID", "server_device_id", str),
+        ("ClientCertSHA256", "server_client_cert_sha256", str),
+        ("RequestBytes", "server_request_bytes", int),
+        ("ResponseBytes", "server_response_bytes", int),
+        ("PayloadBytes", "server_payload_bytes", int),
+        ("TimestampMs", "server_timestamp_ms", int),
+    ]
+    for label, key, cast in optional_fields:
+        km = re.search(rf"{label}:\s*([^,]+)", line)
+        if not km:
+            continue
+        val = km.group(1).strip()
+        try:
+            row[key] = cast(val)
+        except Exception:
+            row[key] = None
+
+    row["server_stdout_tail"] = line[-300:].replace("\n", " | ")
+    return row
+
+
+def parse_server_metrics_log(protocol: str, log_text: str, start_line: int, test_id: str, workload: str, round_index: int) -> Tuple[List[Dict], int]:
+    lines = log_text.splitlines()
+    new_lines = lines[start_line:]
+    rows = []
+    for line in new_lines:
+        row = parse_server_metrics_line(protocol, line, test_id, workload, round_index)
+        if row is not None and row["server_auth_duration_ms"] is not None:
+            rows.append(row)
+    return rows, len(lines)
+
+
+def collect_server_metrics(protocol: str, server, offset_state: Dict[str, int], test_id: str, workload: str, round_index: int) -> List[Dict]:
+    # Give the server task/process a short chance to flush its final metric line.
+    time.sleep(0.2)
+    log_path = f"/tmp/{protocol}_tests123_server.log"
+    output = server.cmd(f"cat {shlex.quote(log_path)} 2>/dev/null || true")
+    rows, new_offset = parse_server_metrics_log(
+        protocol=protocol,
+        log_text=output,
+        start_line=offset_state.get("line", 0),
+        test_id=test_id,
+        workload=workload,
+        round_index=round_index,
+    )
+    offset_state["line"] = new_offset
+    return rows
+
+
 def prepare_project(project_root: Path, protocol_names: List[str]) -> Dict[str, Tuple[str, str]]:
     project_root = project_root.resolve()
     if not (project_root / "Cargo.toml").exists():
@@ -235,13 +424,13 @@ def prepare_project(project_root: Path, protocol_names: List[str]) -> Dict[str, 
         if not cert_dir.exists() or any(not (cert_dir / name).exists() for name in needed):
             run_local("bash scripts/gen_certs.sh", cwd=project_root)
 
-    run_local("cargo build --bins", cwd=project_root)
+    run_local("cargo build --release --bins", cwd=project_root)
 
     bins = {}
     for protocol in protocol_names:
         cfg = PROTOCOLS[protocol]
-        server_bin = project_root / "target" / "debug" / cfg["server_bin"]
-        client_bin = project_root / "target" / "debug" / cfg["client_bin"]
+        server_bin = project_root / "target" / "release" / cfg["server_bin"]
+        client_bin = project_root / "target" / "release" / cfg["client_bin"]
         if not server_bin.exists():
             raise FileNotFoundError(f"Missing server binary: {server_bin}")
         if not client_bin.exists():
@@ -250,19 +439,24 @@ def prepare_project(project_root: Path, protocol_names: List[str]) -> Dict[str, 
     return bins
 
 
-def make_assignments(num_clients: int, clients_dir: Path) -> List[Dict]:
+def make_assignments(num_clients: int, clients_dir: Path, device_mix: str = "raspberry-pi", gateway_count: int = 4) -> List[Dict]:
     clients_dir.mkdir(parents=True, exist_ok=True)
+    profiles = selected_device_profiles(device_mix)
     assignments = []
     for i in range(1, num_clients + 1):
-        dtype = weighted_random_device()
-        profile = DEVICE_PROFILES[dtype]
+        dtype = weighted_random_device(device_mix)
+        profile = profiles[dtype]
         cdir = clients_dir / f"pi{i}"
         cdir.mkdir(parents=True, exist_ok=True)
+        gateway_index = ((i - 1) % max(1, gateway_count)) + 1
         assignments.append({
             "client_index": i,
             "client_host": f"pi{i}",
             "client_ip": f"10.0.0.{i + 1}",
             "client_type": dtype,
+            "traffic_role": profile.get("traffic_role", "auth_client"),
+            "gateway_index": gateway_index,
+            "gateway_name": f"edge{gateway_index}",
             "bw_mbps": profile["bw_mbps"],
             "network_delay_ms": rand_range(profile, "delay_ms_range"),
             "network_jitter_ms": rand_range(profile, "jitter_ms_range"),
@@ -272,7 +466,13 @@ def make_assignments(num_clients: int, clients_dir: Path) -> List[Dict]:
     return assignments
 
 
-def build_network(assignments: List[Dict]):
+def build_network(assignments: List[Dict], args=None):
+    """Build either the original flat LAN or a more realistic multi-tier IoT network.
+
+    multi-tier layout:
+      clients -> edge switches -> aggregation switch -> core switch -> auth server
+      background hosts are attached to edge/core switches and generate traffic separately.
+    """
     net = Mininet(
         controller=Controller,
         switch=OVSSwitch,
@@ -282,19 +482,63 @@ def build_network(assignments: List[Dict]):
     )
     info("*** Adding controller\n")
     net.addController("c0")
-    info("*** Adding switch\n")
-    sw = net.addSwitch("s1")
-    info("*** Adding i7 authentication server\n")
-    server = net.addHost("server", ip=f"{SERVER_IP}/24")
-    net.addLink(server, sw, cls=TCLink, bw=1000, delay="1ms", jitter="0.2ms", loss=0)
+
+    network_model = getattr(args, "network_model", "simple") if args is not None else "simple"
+    gateway_count = getattr(args, "gateway_count", 4) if args is not None else 4
+    background_hosts = getattr(args, "background_hosts", 0) if args is not None else 0
 
     clients = []
-    info("*** Adding randomized Raspberry Pi-class clients\n")
+
+    if network_model == "simple":
+        info("*** Adding simple switch\n")
+        sw = net.addSwitch("s1")
+        info("*** Adding i7 authentication server\n")
+        server = net.addHost("server", ip=f"{SERVER_IP}/24")
+        net.addLink(server, sw, cls=TCLink, bw=1000, delay="1ms", jitter="0.2ms", loss=0)
+
+        info("*** Adding randomized IoT clients on simple LAN\n")
+        for assignment in assignments:
+            client = net.addHost(assignment["client_host"], ip=f"{assignment['client_ip']}/24")
+            net.addLink(
+                client,
+                sw,
+                cls=TCLink,
+                bw=assignment["bw_mbps"],
+                delay=f"{assignment['network_delay_ms']}ms",
+                jitter=f"{assignment['network_jitter_ms']}ms",
+                loss=assignment["packet_loss_percent"],
+            )
+            clients.append(client)
+        net.background_hosts = []
+        return net, server, clients
+
+    info("*** Adding multi-tier IoT switching fabric\n")
+    core = net.addSwitch("core1")
+    agg = net.addSwitch("agg1")
+    net.addLink(core, agg, cls=TCLink, bw=1000, delay="2ms", jitter="0.3ms", loss=0)
+
+    info("*** Adding i7 authentication server behind core switch\n")
+    server = net.addHost("server", ip=f"{SERVER_IP}/24")
+    net.addLink(server, core, cls=TCLink, bw=1000, delay="1ms", jitter="0.2ms", loss=0)
+
+    edge_switches = []
+    for gi in range(1, gateway_count + 1):
+        edge = net.addSwitch(f"edge{gi}")
+        # Edge uplinks represent gateway/backhaul variability.
+        uplink_delay = round(random.uniform(2.0, 12.0), 3)
+        uplink_jitter = round(random.uniform(0.2, 3.0), 3)
+        uplink_loss = round(random.uniform(0.0, 0.6), 3)
+        uplink_bw = random.choice([50, 100, 250, 500])
+        net.addLink(edge, agg, cls=TCLink, bw=uplink_bw, delay=f"{uplink_delay}ms", jitter=f"{uplink_jitter}ms", loss=uplink_loss)
+        edge_switches.append(edge)
+
+    info("*** Adding randomized IoT clients across edge gateways\n")
     for assignment in assignments:
         client = net.addHost(assignment["client_host"], ip=f"{assignment['client_ip']}/24")
+        edge = edge_switches[assignment["gateway_index"] - 1]
         net.addLink(
             client,
-            sw,
+            edge,
             cls=TCLink,
             bw=assignment["bw_mbps"],
             delay=f"{assignment['network_delay_ms']}ms",
@@ -302,7 +546,100 @@ def build_network(assignments: List[Dict]):
             loss=assignment["packet_loss_percent"],
         )
         clients.append(client)
+
+    # Background endpoints create cross traffic independent from auth clients.
+    bg_hosts = []
+    for i in range(1, background_hosts + 1):
+        ip_octet = 150 + i
+        if ip_octet >= 254:
+            break
+        h = net.addHost(f"bg{i}", ip=f"10.0.0.{ip_octet}/24")
+        if i % 4 == 0:
+            attach = core
+            bw, delay, jitter, loss = 500, "3ms", "0.5ms", 0.1
+        else:
+            attach = edge_switches[(i - 1) % len(edge_switches)]
+            bw = random.choice([10, 25, 50, 100])
+            delay = f"{round(random.uniform(5, 55), 3)}ms"
+            jitter = f"{round(random.uniform(1, 12), 3)}ms"
+            loss = round(random.uniform(0.0, 2.5), 3)
+        net.addLink(h, attach, cls=TCLink, bw=bw, delay=delay, jitter=jitter, loss=loss)
+        bg_hosts.append(h)
+    net.background_hosts = bg_hosts
     return net, server, clients
+
+
+def background_intensity_profile(level: str) -> Dict:
+    return BACKGROUND_TRAFFIC_PROFILES.get(level, BACKGROUND_TRAFFIC_PROFILES["none"])
+
+
+def start_background_traffic(net, server, args) -> List:
+    """Start best-effort background traffic generators.
+
+    These flows intentionally do not produce authentication metrics. They create queueing,
+    jitter, packet loss pressure, and server-side interrupt/context-switch noise.
+    """
+    level = getattr(args, "background_traffic", "none")
+    profile = background_intensity_profile(level)
+    bg_hosts = getattr(net, "background_hosts", [])
+    if level == "none" or not bg_hosts:
+        return []
+
+    procs = []
+    sink_port_base = 5201
+    info(f"*** Starting background traffic profile: {level}\n")
+
+    # TCP/UDP sinks on the server. Multiple iperf servers are cheap and avoid port contention.
+    total_sinks = max(profile["tcp"] + profile["udp"], 1)
+    for offset in range(total_sinks):
+        port = sink_port_base + offset
+        procs.append(server.popen(f"iperf -s -p {port} >/tmp/bg_iperf_server_{port}.log 2>&1", shell=True))
+    time.sleep(0.2)
+
+    # Long-running ping flows: small, frequent control-plane-like traffic.
+    for h in bg_hosts[:profile["ping"]]:
+        interval = random.choice([0.1, 0.2, 0.5, 1.0])
+        size = random.choice([32, 64, 128, 256])
+        procs.append(h.popen(
+            f"ping -i {interval} -s {size} {SERVER_IP} >/tmp/{h.name}_bg_ping.log 2>&1",
+            shell=True,
+        ))
+
+    # TCP bulk telemetry / firmware-update-like flows.
+    for idx, h in enumerate(bg_hosts[:profile["tcp"]]):
+        port = sink_port_base + idx
+        procs.append(h.popen(
+            f"while true; do iperf -c {SERVER_IP} -p {port} -t 5 >/tmp/{h.name}_bg_tcp.log 2>&1; sleep {random.randint(1,4)}; done",
+            shell=True,
+        ))
+
+    # UDP video/sensor burst-like flows.
+    start = profile["tcp"]
+    for idx, h in enumerate(bg_hosts[start:start + profile["udp"]]):
+        port = sink_port_base + profile["tcp"] + idx
+        rate = profile["udp_rate"]
+        length = random.choice([256, 512, 1024, 1200])
+        procs.append(h.popen(
+            f"while true; do iperf -u -c {SERVER_IP} -p {port} -b {rate} -l {length} -t 6 >/tmp/{h.name}_bg_udp.log 2>&1; sleep {random.randint(1,3)}; done",
+            shell=True,
+        ))
+
+    return procs
+
+
+def stop_background_traffic(procs: List) -> None:
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    time.sleep(0.2)
+    for p in procs:
+        try:
+            if p.poll() is None:
+                p.kill()
+        except Exception:
+            pass
 
 
 def wrapped_shell_cmd(cmd: str) -> str:
@@ -364,6 +701,12 @@ def client_auth_cmd(protocol: str, client_bin: str, client_workdir: str) -> str:
     server_addr = f"{SERVER_IP}:{cfg['port']}"
     if protocol == "zkarche":
         args = f"--server {server_addr}"
+        zkenv = (
+            "ZKARCHE_FAST_LOOKUP=${ZKARCHE_FAST_LOOKUP:-1} "
+            "ZKARCHE_BENCH_MODE=${ZKARCHE_BENCH_MODE:-1} "
+            "ZKARCHE_DEVICE_ONLY=${ZKARCHE_DEVICE_ONLY:-0} "
+        )
+        return f"cd {shlex.quote(client_workdir)} && {zkenv}{shlex.quote(client_bin)} {args}"
     elif protocol == "mtls":
         device_id = Path(client_workdir).name
         args = f"{server_addr} localhost"
@@ -392,9 +735,14 @@ def start_server(protocol: str, server_bin: str, protocol_workdir: Path, server)
     bind = f"{SERVER_IP}:{cfg['port']}"
     server_dir = protocol_workdir / "server"
     server_dir.mkdir(parents=True, exist_ok=True)
+    server_env = ""
 
     if protocol == "zkarche":
         args = f"--bind {bind} --pairing --pairing-token {shlex.quote(PAIRING_TOKEN)}"
+        server_env = (
+            "ZKARCHE_BENCH_MODE=${ZKARCHE_BENCH_MODE:-1} "
+            "ZKARCHE_ALLOW_DEVICE_ONLY=${ZKARCHE_ALLOW_DEVICE_ONLY:-1} "
+        )
     elif protocol == "mtls":
         args = bind
     elif protocol == "edhoc":
@@ -439,6 +787,9 @@ def base_row(protocol: str, test_id: str, workload: str, a: Dict, run_index: int
         "network_delay_ms": a["network_delay_ms"],
         "network_jitter_ms": a["network_jitter_ms"],
         "packet_loss_percent": a["packet_loss_percent"],
+        "gateway_name": a.get("gateway_name"),
+        "gateway_index": a.get("gateway_index"),
+        "traffic_role": a.get("traffic_role"),
     }
 
 
@@ -477,6 +828,53 @@ def execute_concurrent_batch(protocol: str, client_bin: str, clients, assignment
 
 def execute_sequential(protocol: str, client_bin: str, client, assignment: Dict, iterations: int) -> List[Dict]:
     rows = []
+    if protocol == "zkarche" and os.environ.get("ZKARCHE_CLIENT_REPEAT", "1") != "0":
+        cfg = PROTOCOLS[protocol]
+        server_addr = f"{SERVER_IP}:{cfg['port']}"
+        cmd = (
+            f"cd {shlex.quote(assignment['client_workdir'])} && "
+            f"ZKARCHE_FAST_LOOKUP=${{ZKARCHE_FAST_LOOKUP:-1}} "
+            f"ZKARCHE_BENCH_MODE=${{ZKARCHE_BENCH_MODE:-1}} "
+            f"ZKARCHE_DEVICE_ONLY=${{ZKARCHE_DEVICE_ONLY:-0}} "
+            f"{shlex.quote(client_bin)} --server {server_addr} --repeat {iterations}"
+        )
+        start = time.perf_counter()
+        rc, output = host_cmd_with_status(client, cmd)
+        elapsed_ms = round((time.perf_counter() - start) * 1000.0, 4)
+        metric_rows = parse_all_client_metrics(output)
+        for iteration in range(1, iterations + 1):
+            metrics = metric_rows[iteration - 1] if iteration - 1 < len(metric_rows) else {
+                "auth_duration_ms": None,
+                "auth_sent_bytes": None,
+                "auth_received_bytes": None,
+                "request_bytes": None,
+                "response_bytes": None,
+                "device_id": None,
+                "client_cert_sha256": None,
+            }
+            status = "AUTH_SUCCESS" if rc == 0 and metrics["auth_duration_ms"] is not None else "AUTH_FAILED"
+            row = base_row(protocol, "2", "sequential", assignment, iteration, 1, iteration)
+            row.update({
+                "auth_duration_ms": metrics["auth_duration_ms"],
+                "auth_sent_bytes": metrics["auth_sent_bytes"],
+                "auth_received_bytes": metrics["auth_received_bytes"],
+                "request_bytes": metrics.get("request_bytes"),
+                "response_bytes": metrics.get("response_bytes"),
+                "device_id": metrics.get("device_id"),
+                "client_cert_sha256": metrics.get("client_cert_sha256"),
+                "auth_wall_elapsed_ms": elapsed_ms if iteration == iterations else None,
+                "batch_elapsed_ms": elapsed_ms if iteration == iterations else None,
+                "status": status,
+                "return_code": rc,
+                "stdout_tail": output[-300:].replace("\n", " | "),
+            })
+            rows.append(row)
+            print(
+                f"Test 2 | iter {iteration:02d} | {assignment['client_host']} | "
+                f"{assignment['client_type']:<17} | auth={row['auth_duration_ms']} ms | {status}"
+            )
+        return rows
+
     for iteration in range(1, iterations + 1):
         cmd = client_auth_cmd(protocol, client_bin, assignment["client_workdir"])
         start = time.perf_counter()
@@ -538,22 +936,26 @@ def run_protocol_tests(project_root: Path, protocol: str, bins: Tuple[str, str],
         shutil.rmtree(protocol_workdir)
     (protocol_workdir / "server").mkdir(parents=True, exist_ok=True)
 
-    assignments = make_assignments(args.clients, protocol_workdir / "clients")
+    assignments = make_assignments(args.clients, protocol_workdir / "clients", args.device_mix, args.gateway_count)
     copy_certs_if_needed(project_root, protocol, protocol_workdir, assignments)
     if protocol == "mtls":
         fp = prepare_mtls_authorized_clients(project_root, protocol_workdir)
         print(f"Prepared mTLS client certificate allowlist with SHA-256 fingerprint: {fp}")
 
-    net, server, clients = build_network(assignments)
+    net, server, clients = build_network(assignments, args)
     try:
         info("*** Starting Mininet\n")
         net.start()
+        bg_procs = start_background_traffic(net, server, args)
         info(f"*** Starting {cfg['title']} server\n")
         start_server(protocol, server_bin, protocol_workdir, server)
+        server_metric_offset = {"line": 0}
 
         if protocol == "zkarche":
             info("*** Preparing ZK-ARCHE per-client identity state\n")
             prepare_zkarche_state(server_bin, client_bin, protocol_workdir, assignments, server, clients)
+            # Exclude enrollment/setup log lines from online-authentication server metrics.
+            server_metric_offset["line"] = len((server.cmd(f"cat /tmp/{protocol}_tests123_server.log 2>/dev/null || true") or "").splitlines())
 
         print(f"\n=== {cfg['title']} Tests 1/2/3 Mininet Runner ===")
         print(f"Server CPU: {SERVER_CPU}")
@@ -561,6 +963,7 @@ def run_protocol_tests(project_root: Path, protocol: str, bins: Tuple[str, str],
         print(f"Clients:    {args.clients}")
         print(f"Iterations: {args.iterations}")
         print(f"Results:    {args.results_dir}")
+        print(f"Network:    {args.network_model}, device_mix={args.device_mix}, gateways={args.gateway_count}, background={args.background_traffic}, bg_hosts={args.background_hosts}")
         print("")
 
         if "1" in selected_tests:
@@ -568,23 +971,38 @@ def run_protocol_tests(project_root: Path, protocol: str, bins: Tuple[str, str],
             rows = execute_concurrent_batch(protocol, client_bin, clients, assignments, "1", "concurrent", 1)
             print_batch_summary("Test 1", rows)
             write_csv(Path(args.results_dir) / f"{protocol}_test1_concurrent.csv", rows)
+            server_rows = collect_server_metrics(protocol, server, server_metric_offset, "1", "concurrent", 1)
+            print_batch_summary("Test 1 server", [{"status": "AUTH_SUCCESS", "auth_duration_ms": r["server_auth_duration_ms"]} for r in server_rows])
+            write_csv(Path(args.results_dir) / f"{protocol}_test1_concurrent_server.csv", server_rows)
 
         if "2" in selected_tests:
             print("--- Test 2: single client, 50 sequential authentications ---")
             rows = execute_sequential(protocol, client_bin, clients[0], assignments[0], args.iterations)
             print_batch_summary("Test 2", rows)
             write_csv(Path(args.results_dir) / f"{protocol}_test2_sequential.csv", rows)
+            server_rows = collect_server_metrics(protocol, server, server_metric_offset, "2", "sequential", 1)
+            print_batch_summary("Test 2 server", [{"status": "AUTH_SUCCESS", "auth_duration_ms": r["server_auth_duration_ms"]} for r in server_rows])
+            write_csv(Path(args.results_dir) / f"{protocol}_test2_sequential_server.csv", server_rows)
 
         if "3" in selected_tests:
             print("--- Test 3: 50 clients x 50 authentication rounds under high load ---")
             all_rows = []
+            all_server_rows = []
             for round_index in range(1, args.iterations + 1):
                 rows = execute_concurrent_batch(protocol, client_bin, clients, assignments, "3", "high_load", round_index)
                 all_rows.extend(rows)
                 print_batch_summary(f"Test 3 round {round_index:02d}", rows)
+                server_rows = collect_server_metrics(protocol, server, server_metric_offset, "3", "high_load", round_index)
+                all_server_rows.extend(server_rows)
+                print_batch_summary(f"Test 3 server round {round_index:02d}", [{"status": "AUTH_SUCCESS", "auth_duration_ms": r["server_auth_duration_ms"]} for r in server_rows])
             write_csv(Path(args.results_dir) / f"{protocol}_test3_high_load.csv", all_rows)
+            write_csv(Path(args.results_dir) / f"{protocol}_test3_high_load_server.csv", all_server_rows)
 
     finally:
+        try:
+            stop_background_traffic(locals().get("bg_procs", []))
+        except Exception:
+            pass
         info(f"*** Stopping {cfg['title']} server and Mininet\n")
         try:
             server.cmd(f"pkill -f {shlex.quote(cfg['server_bin'])} || true")
@@ -603,6 +1021,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workdir", default=DEFAULT_WORKDIR)
     p.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--network-model", default="multi-tier", choices=["simple", "multi-tier"], help="Use the old flat LAN or a multi-tier IoT access/aggregation/core topology")
+    p.add_argument("--gateway-count", type=int, default=4, help="Number of edge switches/gateways in multi-tier mode")
+    p.add_argument("--device-mix", default="heterogeneous-iot", choices=["raspberry-pi", "heterogeneous-iot"], help="Authentication client device/link profile mix")
+    p.add_argument("--background-hosts", type=int, default=16, help="Number of non-authentication background traffic hosts")
+    p.add_argument("--background-traffic", default="medium", choices=["none", "light", "medium", "heavy", "burst"], help="Background traffic intensity")
+    p.add_argument("--zkarche-device-only", action="store_true", help="Run optimized ZK-ARCHE device-only mode by setting ZKARCHE_DEVICE_ONLY=1")
+    p.add_argument("--zkarche-full", action="store_true", help="Run full ZK-ARCHE proof mode while still using release build and fast handle lookup")
     return p.parse_args()
 
 
@@ -610,6 +1035,13 @@ def main() -> int:
     args = parse_args()
     if args.seed is not None:
         random.seed(args.seed)
+    if args.zkarche_device_only:
+        os.environ["ZKARCHE_DEVICE_ONLY"] = "1"
+    if args.zkarche_full:
+        os.environ["ZKARCHE_DEVICE_ONLY"] = "0"
+    os.environ.setdefault("ZKARCHE_FAST_LOOKUP", "1")
+    os.environ.setdefault("ZKARCHE_BENCH_MODE", "1")
+    os.environ.setdefault("ZKARCHE_ALLOW_DEVICE_ONLY", "1")
     setLogLevel("info")
     project_root = Path(args.project).resolve()
     protocols = ["zkarche", "mtls", "edhoc"] if args.protocol == "all" else [args.protocol]

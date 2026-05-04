@@ -10,11 +10,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::OnceLock;
 
 use blake2::{Blake2b512, Digest};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::VartimeMultiscalarMul;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
@@ -28,6 +30,9 @@ const SETUP_CHALLENGE_LEN: usize = 16;
 
 const MSG_SETUP: u8 = 0x01;
 const MSG_AUTH_V2: u8 = 0x03;
+const MSG_AUTH_V3: u8 = 0x04;
+const AUTH_FLAG_DEVICE_ONLY: u8 = 0x01;
+const AUTH_FLAG_HANDLE_LOOKUP: u8 = 0x02;
 #[allow(dead_code)]
 const MSG_GOODBYE: u8 = 0x15;
 
@@ -164,8 +169,52 @@ fn hash_to_point(label: &[u8]) -> RistrettoPoint {
     RistrettoPoint::from_uniform_bytes(&wide)
 }
 
+static ATTR_H: OnceLock<RistrettoPoint> = OnceLock::new();
+
 fn attr_h() -> RistrettoPoint {
-    hash_to_point(b"iot-auth/attr-h/v1")
+    ATTR_H.get_or_init(|| hash_to_point(b"iot-auth/attr-h/v1")).clone()
+}
+
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+        .unwrap_or(false)
+}
+
+fn bench_mode() -> bool {
+    env_truthy("ZKARCHE_BENCH_MODE")
+}
+
+fn bench_log(label: &str, elapsed: Duration) {
+    if bench_mode() {
+        eprintln!("BENCH server_{}_us={}", label, elapsed.as_micros());
+    }
+}
+
+fn compute_device_handle(device_pub: &RistrettoPoint) -> [u8; 16] {
+    let mut h = Sha256::new();
+    sha2::Digest::update(&mut h, b"zkarche/device-handle/v1");
+    sha2::Digest::update(&mut h, device_pub.compress().as_bytes());
+    let out = h.finalize();
+    let mut handle = [0u8; 16];
+    handle.copy_from_slice(&out[..16]);
+    handle
+}
+
+fn build_handle_index(reg: &HashMap<[u8; 32], DeviceRecord>) -> HashMap<[u8; 16], ([u8; 32], DeviceRecord)> {
+    let mut out = HashMap::with_capacity(reg.len());
+    for (id, rec) in reg.iter() {
+        out.insert(compute_device_handle(&rec.pubkey), (*id, *rec));
+    }
+    out
+}
+
+fn vartime_schnorr_check(base: RistrettoPoint, pubkey: &RistrettoPoint, a: &RistrettoPoint, c: &Scalar, s: &Scalar) -> bool {
+    // Check base*s == A + pubkey*c as base*s - pubkey*c - A == identity.
+    RistrettoPoint::vartime_multiscalar_mul(
+        [*s, -*c, -Scalar::from(1u64)],
+        [base, *pubkey, *a],
+    ) == RistrettoPoint::default()
 }
 
 /// Rejects the neutral Ristretto point so invalid or low-order inputs are not accepted.
@@ -203,7 +252,7 @@ fn schnorr_verify_setup(
             (b"setup_challenge", TranscriptValue::Bytes(setup_challenge)),
         ],
     );
-    RISTRETTO_BASEPOINT_POINT * s == a + pubkey * c
+    vartime_schnorr_check(RISTRETTO_BASEPOINT_POINT, pubkey, a, &c, s)
 }
 
 /// Creates the server setup proof for raw-public-key enrollment.
@@ -255,7 +304,7 @@ fn schnorr_verify_auth(
             (b"eph_c", TranscriptValue::Point(eph_c)),
         ],
     );
-    RISTRETTO_BASEPOINT_POINT * s == a + expected_pubkey * c
+    vartime_schnorr_check(RISTRETTO_BASEPOINT_POINT, expected_pubkey, a, &c, s)
 }
 
 /// Creates the server Schnorr proof that demonstrates possession of the pinned static secret.
@@ -329,7 +378,7 @@ fn verify_role_rerandomization(
         ],
     );
     // Schnorr check in base h: h * s == a + (C' - C) * c.
-    h * s == *a + diff * c
+    vartime_schnorr_check(h, &diff, a, &c, s)
 }
 
 /// Verifies the CDS OR-proof that C' = g^role * h^blind' for some role in
@@ -390,9 +439,7 @@ fn verify_role_set_membership(
     // where Y_i = C' - g^{r_i}.
     for (i, (a_i, c_i, s_i)) in proof.iter().enumerate() {
         let y_i = c_prime - RISTRETTO_BASEPOINT_POINT * Scalar::from(ALLOWED_ROLES[i]);
-        let lhs = h * s_i;
-        let rhs = *a_i + y_i * c_i;
-        if lhs != rhs {
+        if !vartime_schnorr_check(h, &y_i, a_i, c_i, s_i) {
             return false;
         }
     }
@@ -939,12 +986,13 @@ fn handle_setup(
     server_static_secret: &Scalar,
     server_static_pub: &RistrettoPoint,
     reg: &Arc<RwLock<HashMap<[u8; 32], DeviceRecord>>>,
+    handle_index: &Arc<RwLock<HashMap<[u8; 16], ([u8; 32], DeviceRecord)>>>,
     sent: &mut usize,
     recv: &mut usize,
     failures: &Arc<Mutex<FailureTracker>>,
     peer_key: &str,
 ) -> std::io::Result<()> {
-    if failures.lock().unwrap().is_blocked(peer_key) {
+    if !bench_mode() && failures.lock().unwrap().is_blocked(peer_key) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer temporarily rate limited"));
     }
 
@@ -1009,10 +1057,12 @@ fn handle_setup(
     let upsert = {
         let mut reg_w = reg.write().unwrap();
         let existed = reg_w.contains_key(&device_id);
-        reg_w.insert(device_id, DeviceRecord {
+        let rec = DeviceRecord {
             pubkey: device_static_pub,
             role_commitment,
-        });
+        };
+        reg_w.insert(device_id, rec);
+        handle_index.write().unwrap().insert(compute_device_handle(&rec.pubkey), (device_id, rec));
         save_registry_atomic(REGISTRY_BIN, REGISTRY_BAK, &reg_w)?;
         !existed
     };
@@ -1037,34 +1087,58 @@ fn handle_setup(
 /// ALLOWED_ROLES. Replay protection keys on (pid, nonce_c). The session key
 /// and KC transcript likewise bind to pid only, never to device_id, so a
 /// passive observer sees only unlinkable per-session material.
-fn handle_auth_v2(
+fn handle_auth_common(
     mut stream: TcpStream,
     server_static_secret: &Scalar,
     server_static_pub: &RistrettoPoint,
     reg: &Arc<RwLock<HashMap<[u8; 32], DeviceRecord>>>,
+    handle_index: &Arc<RwLock<HashMap<[u8; 16], ([u8; 32], DeviceRecord)>>>,
     replay: &Arc<Mutex<ReplayCache>>,
     sent: &mut usize,
     recv: &mut usize,
     failures: &Arc<Mutex<FailureTracker>>,
     peer_key: &str,
+    v3: bool,
 ) -> std::io::Result<()> {
-    // Expected v2 payload: pid(32) | a_c(32) | s_c(32) | nonce_c(32) |
-    //   eph_c(32) | c_prime(32) | rerand_a(32) | rerand_s(32) |
-    //   [ A_i(32) | c_i(32) | s_i(32) ] * ALLOWED_ROLES.len()
-    let n_roles = ALLOWED_ROLES.len();
-    let expected_len = 256 + 96 * n_roles;
+    let mut flags = 0u8;
+    let mut handle_opt: Option<[u8; 16]> = None;
+    if v3 {
+        flags = recv_u8(&mut stream, recv)?;
+        if flags & AUTH_FLAG_HANDLE_LOOKUP != 0 {
+            let mut h = [0u8; 16];
+            recv_exact(&mut stream, &mut h, recv)?;
+            handle_opt = Some(h);
+        }
+    }
+    let device_only = flags & AUTH_FLAG_DEVICE_ONLY != 0;
+    if device_only && !(env_truthy("ZKARCHE_ALLOW_DEVICE_ONLY") || bench_mode()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "device-only fast mode requested but server did not enable ZKARCHE_ALLOW_DEVICE_ONLY=1 or ZKARCHE_BENCH_MODE=1",
+        ));
+    }
 
+    let n_roles = ALLOWED_ROLES.len();
+    let expected_len = if device_only { 160 } else { 256 + 96 * n_roles };
+
+    let t = Instant::now();
     let mut pt = vec![0u8; expected_len];
     recv_exact(&mut stream, &mut pt, recv)?;
+    bench_log("read_auth_payload", t.elapsed());
 
     let mut pid = [0u8; 32];         pid.copy_from_slice(&pt[0..32]);
     let mut a_c_bytes = [0u8; 32];   a_c_bytes.copy_from_slice(&pt[32..64]);
     let mut s_c_bytes = [0u8; 32];   s_c_bytes.copy_from_slice(&pt[64..96]);
     let mut nonce_c = [0u8; 32];     nonce_c.copy_from_slice(&pt[96..128]);
     let mut eph_c_bytes = [0u8; 32]; eph_c_bytes.copy_from_slice(&pt[128..160]);
-    let mut c_prime_bytes = [0u8; 32]; c_prime_bytes.copy_from_slice(&pt[160..192]);
-    let mut rerand_a_bytes = [0u8; 32]; rerand_a_bytes.copy_from_slice(&pt[192..224]);
-    let mut rerand_s_bytes = [0u8; 32]; rerand_s_bytes.copy_from_slice(&pt[224..256]);
+    let mut c_prime_bytes = [0u8; 32];
+    let mut rerand_a_bytes = [0u8; 32];
+    let mut rerand_s_bytes = [0u8; 32];
+    if !device_only {
+        c_prime_bytes.copy_from_slice(&pt[160..192]);
+        rerand_a_bytes.copy_from_slice(&pt[192..224]);
+        rerand_s_bytes.copy_from_slice(&pt[224..256]);
+    }
 
     let a_c = CompressedRistretto(a_c_bytes)
         .decompress()
@@ -1079,38 +1153,46 @@ fn handle_auth_v2(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid eph_c"))?;
     reject_identity(&eph_c, "eph_c")?;
 
-    let c_prime = CompressedRistretto(c_prime_bytes)
-        .decompress()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid c_prime"))?;
-    reject_identity(&c_prime, "c_prime")?;
-
-    let rerand_a = CompressedRistretto(rerand_a_bytes)
-        .decompress()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid rerand_a"))?;
-    reject_identity(&rerand_a, "rerand_a")?;
-
-    let rerand_s = Option::from(Scalar::from_canonical_bytes(rerand_s_bytes))
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical rerand_s"))?;
-
-    // Parse the OR-proof triples.
+    let mut c_prime_opt: Option<RistrettoPoint> = None;
+    let mut rerand_a_opt: Option<RistrettoPoint> = None;
+    let mut rerand_s_opt: Option<Scalar> = None;
     let mut or_proof: Vec<(RistrettoPoint, Scalar, Scalar)> = Vec::with_capacity(n_roles);
-    let or_base = 256;
-    for i in 0..n_roles {
-        let off = or_base + i * 96;
-        let mut a_i_b = [0u8; 32]; a_i_b.copy_from_slice(&pt[off..off + 32]);
-        let mut c_i_b = [0u8; 32]; c_i_b.copy_from_slice(&pt[off + 32..off + 64]);
-        let mut s_i_b = [0u8; 32]; s_i_b.copy_from_slice(&pt[off + 64..off + 96]);
-        let a_i = CompressedRistretto(a_i_b)
+
+    if !device_only {
+        let c_prime = CompressedRistretto(c_prime_bytes)
             .decompress()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid or_proof A_i"))?;
-        let c_i = Option::from(Scalar::from_canonical_bytes(c_i_b))
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical or_proof c_i"))?;
-        let s_i = Option::from(Scalar::from_canonical_bytes(s_i_b))
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical or_proof s_i"))?;
-        or_proof.push((a_i, c_i, s_i));
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid c_prime"))?;
+        reject_identity(&c_prime, "c_prime")?;
+
+        let rerand_a = CompressedRistretto(rerand_a_bytes)
+            .decompress()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid rerand_a"))?;
+        reject_identity(&rerand_a, "rerand_a")?;
+
+        let rerand_s = Option::from(Scalar::from_canonical_bytes(rerand_s_bytes))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical rerand_s"))?;
+
+        let or_base = 256;
+        for i in 0..n_roles {
+            let off = or_base + i * 96;
+            let mut a_i_b = [0u8; 32]; a_i_b.copy_from_slice(&pt[off..off + 32]);
+            let mut c_i_b = [0u8; 32]; c_i_b.copy_from_slice(&pt[off + 32..off + 64]);
+            let mut s_i_b = [0u8; 32]; s_i_b.copy_from_slice(&pt[off + 64..off + 96]);
+            let a_i = CompressedRistretto(a_i_b)
+                .decompress()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid or_proof A_i"))?;
+            let c_i = Option::from(Scalar::from_canonical_bytes(c_i_b))
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical or_proof c_i"))?;
+            let s_i = Option::from(Scalar::from_canonical_bytes(s_i_b))
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical or_proof s_i"))?;
+            or_proof.push((a_i, c_i, s_i));
+        }
+        c_prime_opt = Some(c_prime);
+        rerand_a_opt = Some(rerand_a);
+        rerand_s_opt = Some(rerand_s);
     }
 
-    if failures.lock().unwrap().is_blocked(peer_key) {
+    if !bench_mode() && failures.lock().unwrap().is_blocked(peer_key) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer temporarily rate limited"));
     }
 
@@ -1125,16 +1207,24 @@ fn handle_auth_v2(
                 "replay detected",
             ));
         }
-        rc.take_persist_blob(false)
+        if bench_mode() { None } else { rc.take_persist_blob(false) }
     };
     if let Some(blob) = replay_persist_blob {
         write_private_file_atomic(REPLAY_CACHE_BIN, &blob)?;
     }
 
-    // Resolve pid → enrolled record via an O(N) registry scan. The client
-    // never sends its device_id on the wire; the server recomputes the
-    // expected pid for each registered device_pub and matches.
-    let (_device_id, record) = {
+    let t = Instant::now();
+    let (_device_id, record) = if let Some(handle) = handle_opt {
+        let idx = handle_index.read().unwrap();
+        let (id, rec) = idx.get(&handle).copied().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "unknown device handle")
+        })?;
+        let expected_pid = compute_pid(&rec.pubkey, &nonce_c, &eph_c, server_static_pub);
+        if expected_pid.ct_eq(&pid).unwrap_u8() == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "device handle does not match pid"));
+        }
+        (id, rec)
+    } else {
         let reg_r = reg.read().unwrap();
         match lookup_record_by_pid(&reg_r, &pid, &nonce_c, &eph_c, server_static_pub) {
             Some((id, rec)) => (id, rec),
@@ -1146,38 +1236,50 @@ fn handle_auth_v2(
             }
         }
     };
+    bench_log(if handle_opt.is_some() { "lookup_o1_handle" } else { "lookup_on_pid_scan" }, t.elapsed());
 
     // (1) Client possession-of-key proof, bound to pid.
+    let t = Instant::now();
     if !schnorr_verify_auth(&record.pubkey, &pid, &a_c, &s_c, &nonce_c, &eph_c) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "client Schnorr proof invalid",
         ));
     }
+    bench_log("verify_client_schnorr", t.elapsed());
 
-    // (2) C' is a re-randomization of the enrolled role commitment.
-    if !verify_role_rerandomization(
-        &record.role_commitment,
-        &c_prime,
-        &rerand_a,
-        &rerand_s,
-        &pid,
-        &nonce_c,
-        &eph_c,
-    ) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "role re-randomization proof invalid",
-        ));
-    }
+    if !device_only {
+        let c_prime = c_prime_opt.as_ref().expect("c_prime parsed");
+        let rerand_a = rerand_a_opt.as_ref().expect("rerand_a parsed");
+        let rerand_s = rerand_s_opt.as_ref().expect("rerand_s parsed");
 
-    // (3) C' commits to a value in ALLOWED_ROLES (zero-knowledge; server does
-    // not learn which allowed role the device actually holds).
-    if !verify_role_set_membership(&c_prime, &or_proof, &pid, &nonce_c, &eph_c) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "role set-membership proof invalid",
-        ));
+        let t = Instant::now();
+        if !verify_role_rerandomization(
+            &record.role_commitment,
+            c_prime,
+            rerand_a,
+            rerand_s,
+            &pid,
+            &nonce_c,
+            &eph_c,
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "role re-randomization proof invalid",
+            ));
+        }
+        bench_log("verify_role_rerandomization", t.elapsed());
+
+        let t = Instant::now();
+        if !verify_role_set_membership(c_prime, &or_proof, &pid, &nonce_c, &eph_c) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "role set-membership proof invalid",
+            ));
+        }
+        bench_log("verify_role_set_membership", t.elapsed());
+    } else {
+        bench_log("device_only_role_proofs_skipped", Duration::from_micros(0));
     }
 
     // Server-side mutual authentication + session establishment.
@@ -1241,8 +1343,10 @@ fn handle_auth_v2(
         );
     }
 
-    if let Some(blob) = replay.lock().unwrap().take_persist_blob(true) {
-        write_private_file_atomic(REPLAY_CACHE_BIN, &blob)?;
+    if !bench_mode() {
+        if let Some(blob) = replay.lock().unwrap().take_persist_blob(true) {
+            write_private_file_atomic(REPLAY_CACHE_BIN, &blob)?;
+        }
     }
 
     session_key.zeroize();
@@ -1250,6 +1354,36 @@ fn handle_auth_v2(
     println!("Server[ONLINE]: one-shot v2 session completed for pid={}", hex::encode(pid));
     let _ = stream.shutdown(std::net::Shutdown::Both);
     Ok(())
+}
+
+fn handle_auth_v2(
+    stream: TcpStream,
+    server_static_secret: &Scalar,
+    server_static_pub: &RistrettoPoint,
+    reg: &Arc<RwLock<HashMap<[u8; 32], DeviceRecord>>>,
+    handle_index: &Arc<RwLock<HashMap<[u8; 16], ([u8; 32], DeviceRecord)>>>,
+    replay: &Arc<Mutex<ReplayCache>>,
+    sent: &mut usize,
+    recv: &mut usize,
+    failures: &Arc<Mutex<FailureTracker>>,
+    peer_key: &str,
+) -> std::io::Result<()> {
+    handle_auth_common(stream, server_static_secret, server_static_pub, reg, handle_index, replay, sent, recv, failures, peer_key, false)
+}
+
+fn handle_auth_v3(
+    stream: TcpStream,
+    server_static_secret: &Scalar,
+    server_static_pub: &RistrettoPoint,
+    reg: &Arc<RwLock<HashMap<[u8; 32], DeviceRecord>>>,
+    handle_index: &Arc<RwLock<HashMap<[u8; 16], ([u8; 32], DeviceRecord)>>>,
+    replay: &Arc<Mutex<ReplayCache>>,
+    sent: &mut usize,
+    recv: &mut usize,
+    failures: &Arc<Mutex<FailureTracker>>,
+    peer_key: &str,
+) -> std::io::Result<()> {
+    handle_auth_common(stream, server_static_secret, server_static_pub, reg, handle_index, replay, sent, recv, failures, peer_key, true)
 }
 
 
@@ -1261,6 +1395,7 @@ fn handle_client(
     server_static_pub: Arc<RistrettoPoint>,
     policy: PairingPolicy,
     reg: Arc<RwLock<HashMap<[u8; 32], DeviceRecord>>>,
+    handle_index: Arc<RwLock<HashMap<[u8; 16], ([u8; 32], DeviceRecord)>>>,
     replay: Arc<Mutex<ReplayCache>>,
     failures: Arc<Mutex<FailureTracker>>,
     _active_guard: ActiveConnGuard,
@@ -1297,6 +1432,7 @@ fn handle_client(
             &server_static_secret,
             &server_static_pub,
             &reg,
+            &handle_index,
             &mut sent,
             &mut recv_bytes,
             &failures,
@@ -1304,7 +1440,11 @@ fn handle_client(
         ),
         MSG_AUTH_V2 => handle_auth_v2(
             stream, &server_static_secret, &server_static_pub,
-            &reg, &replay, &mut sent, &mut recv_bytes, &failures, &peer_key,
+            &reg, &handle_index, &replay, &mut sent, &mut recv_bytes, &failures, &peer_key,
+        ),
+        MSG_AUTH_V3 => handle_auth_v3(
+            stream, &server_static_secret, &server_static_pub,
+            &reg, &handle_index, &replay, &mut sent, &mut recv_bytes, &failures, &peer_key,
         ),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1313,9 +1453,9 @@ fn handle_client(
     };
 
     match res {
-        Ok(()) => failures.lock().unwrap().note_success(&peer_key),
+        Ok(()) => { if !bench_mode() { failures.lock().unwrap().note_success(&peer_key); } },
         Err(e) => {
-            failures.lock().unwrap().note_failure(&peer_key);
+            if !bench_mode() { failures.lock().unwrap().note_failure(&peer_key); }
             eprintln!("Server: request from {:?} failed: {}", peer, e);
         }
     }
@@ -1359,7 +1499,8 @@ fn main() -> std::io::Result<()> {
             }
             "--print-pubkey" => { print_pubkey = true; i += 1; }
             _ => {
-                eprintln!("Usage: {} [--bind 0.0.0.0:4000] [--pairing] [--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey]", prog);
+                eprintln!("Usage: {} [--bind 0.0.0.0:4000] [--pairing] [--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey]
+  env options: ZKARCHE_BENCH_MODE=1 ZKARCHE_ALLOW_DEVICE_ONLY=1", prog);
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unknown argument: {}", args[i])));
             }
         }
@@ -1380,7 +1521,9 @@ fn main() -> std::io::Result<()> {
     let reg_map: HashMap<[u8; 32], DeviceRecord> = load_registry(REGISTRY_BIN).unwrap_or_default();
 
     // Initialize shared server state and begin accepting TCP clients.
+    let handle_map = build_handle_index(&reg_map);
     let reg = Arc::new(RwLock::new(reg_map));
+    let handle_index = Arc::new(RwLock::new(handle_map));
     let replay_state = ReplayCache::load(REPLAY_CACHE_BIN).unwrap_or_default();
     let replay = Arc::new(Mutex::new(replay_state));
     let failures = Arc::new(Mutex::new(FailureTracker::default()));
@@ -1405,6 +1548,7 @@ fn main() -> std::io::Result<()> {
         let sp2 = Arc::clone(&sp);
         let pol2 = policy.clone();
         let reg2 = Arc::clone(&reg);
+        let handle_index2 = Arc::clone(&handle_index);
         let rep2 = Arc::clone(&replay);
         let failures2 = Arc::clone(&failures);
         let active2 = Arc::clone(&active_connections);
@@ -1414,7 +1558,7 @@ fn main() -> std::io::Result<()> {
             continue;
         };
         thread::spawn(move || {
-            handle_client(stream, ss2, sp2, pol2, reg2, rep2, failures2, active_guard);
+            handle_client(stream, ss2, sp2, pol2, reg2, handle_index2, rep2, failures2, active_guard);
         });
     }
 }
