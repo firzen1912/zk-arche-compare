@@ -81,9 +81,7 @@ Each simulation creates one i7-class server and randomized Raspberry Pi-class
 clients. The output CSV includes `client_type` for every run.
 
 ```bash
-sudo python3 experiments/mininet/zkarche_mininet_50_iot.py --project . --seed 42
-sudo python3 experiments/mininet/mtls_mininet_50_iot.py    --project . --seed 42
-sudo python3 experiments/mininet/edhoc_mininet_50_iot.py   --project . --seed 42
+sudo env   "PATH=$HOME/.cargo/bin:$PATH"   "RUSTUP_HOME=$HOME/.rustup"   "CARGO_HOME=$HOME/.cargo"   .venv/bin/python experiments/mininet/mininet_tests_123.py   --project .   --protocol all   --test all   --clients 50   --iterations 50   --seed 42   --network-model simple   --device-mix raspberry-pi   --background-traffic none
 ```
 
 See `docs/MININET_EXPERIMENTS.md` for details.

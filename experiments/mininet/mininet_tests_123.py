@@ -21,7 +21,7 @@ Example:
   sudo python3 experiments/mininet/mininet_tests_123.py --project . --protocol zkarche --test all --seed 42
   sudo python3 experiments/mininet/mininet_tests_123.py --project . --protocol all --test all --seed 42
 
-CSV outputs:
+CSV outputs include setup/full-session columns for ZK-ARCHE:
   results/mininet/zkarche_test1_concurrent.csv
   results/mininet/zkarche_test2_sequential.csv
   results/mininet/zkarche_test3_high_load.csv
@@ -304,6 +304,69 @@ def parse_all_client_metrics(output: str) -> List[Dict[str, Optional[float]]]:
                 metrics_list.append(m)
     return metrics_list
 
+
+
+def zkarche_setup_fields(assignment: Dict) -> Dict[str, Optional[float]]:
+    """Return per-client ZK-ARCHE setup metrics captured during enrollment."""
+    return {
+        "setup_duration_ms": assignment.get("setup_duration_ms"),
+        "setup_sent_bytes": assignment.get("setup_sent_bytes"),
+        "setup_received_bytes": assignment.get("setup_received_bytes"),
+        "setup_wall_elapsed_ms": assignment.get("setup_wall_elapsed_ms"),
+    }
+
+
+def add_full_session_metrics(protocol: str, assignment: Dict, row: Dict, metrics: Dict) -> None:
+    """Normalize all protocols to a full-session CSV schema.
+
+    For ZK-ARCHE, full session = setup/enrollment + online authentication.
+    For EDHOC and mTLS, the client metric already covers the full measured
+    authenticated exchange, so setup is zero and full_session == auth.
+    """
+    auth_ms = metrics.get("auth_duration_ms")
+    auth_sent = metrics.get("auth_sent_bytes")
+    auth_recv = metrics.get("auth_received_bytes")
+
+    if protocol == "zkarche":
+        setup_ms = assignment.get("setup_duration_ms")
+        setup_sent = assignment.get("setup_sent_bytes")
+        setup_recv = assignment.get("setup_received_bytes")
+        setup_wall = assignment.get("setup_wall_elapsed_ms")
+    else:
+        setup_ms = 0.0
+        setup_sent = 0
+        setup_recv = 0
+        setup_wall = 0.0
+
+    row.update({
+        "setup_duration_ms": setup_ms,
+        "setup_sent_bytes": setup_sent,
+        "setup_received_bytes": setup_recv,
+        "setup_wall_elapsed_ms": setup_wall,
+        "auth_duration_ms": auth_ms,
+        "auth_sent_bytes": auth_sent,
+        "auth_received_bytes": auth_recv,
+    })
+
+    if auth_ms is not None and setup_ms is not None:
+        row["full_session_duration_ms"] = round(float(setup_ms) + float(auth_ms), 4)
+    else:
+        row["full_session_duration_ms"] = auth_ms
+
+    if auth_sent is not None and setup_sent is not None:
+        row["full_session_sent_bytes"] = int(setup_sent) + int(auth_sent)
+    else:
+        row["full_session_sent_bytes"] = auth_sent
+
+    if auth_recv is not None and setup_recv is not None:
+        row["full_session_received_bytes"] = int(setup_recv) + int(auth_recv)
+    else:
+        row["full_session_received_bytes"] = auth_recv
+
+    if row.get("full_session_sent_bytes") is not None and row.get("full_session_received_bytes") is not None:
+        row["full_session_total_bytes"] = int(row["full_session_sent_bytes"]) + int(row["full_session_received_bytes"])
+    else:
+        row["full_session_total_bytes"] = None
 
 
 def empty_server_metric_row(protocol: str, test_id: str, workload: str, round_index: int) -> Dict[str, Optional[float]]:
@@ -674,6 +737,13 @@ def copy_certs_if_needed(project_root: Path, protocol: str, protocol_workdir: Pa
 
 
 def prepare_zkarche_state(server_bin: str, client_bin: str, protocol_workdir: Path, assignments: List[Dict], server, clients) -> None:
+    """Pin server key and enroll each ZK-ARCHE client.
+
+    Setup metrics are stored on each assignment so every later auth row can
+    include full_session_duration_ms = setup_duration_ms + auth_duration_ms.
+    The server-public-key pinning step is treated as out-of-band provisioning
+    and is not included in setup_duration_ms.
+    """
     server_dir = protocol_workdir / "server"
     server_pub = run_local(f"{shlex.quote(server_bin)} --print-pubkey", cwd=server_dir).splitlines()[-1].strip()
     if not re.fullmatch(r"[0-9a-fA-F]{64}", server_pub):
@@ -691,10 +761,47 @@ def prepare_zkarche_state(server_bin: str, client_bin: str, protocol_workdir: Pa
             f"{shlex.quote(client_bin)} --server {SERVER_IP}:{PROTOCOLS['zkarche']['port']} "
             f"--setup --pairing-token {shlex.quote(PAIRING_TOKEN)}"
         )
+        setup_start = time.perf_counter()
         rc, out = host_cmd_with_status(client, setup_cmd)
+        setup_wall_ms = round((time.perf_counter() - setup_start) * 1000.0, 4)
         if rc != 0:
             raise RuntimeError(f"ZK-ARCHE setup failed for {client.name}:\n{out}")
 
+        setup_metrics = parse_client_metrics(out)
+        assignments[idx]["setup_duration_ms"] = setup_metrics.get("auth_duration_ms")
+        assignments[idx]["setup_sent_bytes"] = setup_metrics.get("auth_sent_bytes")
+        assignments[idx]["setup_received_bytes"] = setup_metrics.get("auth_received_bytes")
+        assignments[idx]["setup_wall_elapsed_ms"] = setup_wall_ms
+
+        # Capture the server-side setup metric for the same enrollment. Setup
+        # runs sequentially here, so the latest SERVER METRICS line belongs to
+        # this client setup exchange.
+        time.sleep(0.1)
+        setup_log = server.cmd("cat /tmp/zkarche_tests123_server.log 2>/dev/null || true")
+        setup_server_rows, _ = parse_server_metrics_log(
+            protocol="zkarche",
+            log_text=setup_log,
+            start_line=0,
+            test_id="setup",
+            workload="setup",
+            round_index=0,
+        )
+        if setup_server_rows:
+            sr = setup_server_rows[-1]
+            assignments[idx]["server_setup_duration_ms"] = sr.get("server_auth_duration_ms")
+            assignments[idx]["server_setup_sent_bytes"] = sr.get("server_sent_bytes")
+            assignments[idx]["server_setup_received_bytes"] = sr.get("server_received_bytes")
+        else:
+            assignments[idx]["server_setup_duration_ms"] = None
+            assignments[idx]["server_setup_sent_bytes"] = None
+            assignments[idx]["server_setup_received_bytes"] = None
+
+        print(
+            f"ZK-ARCHE setup | {client.name:>4} | {assignments[idx]['client_type']:<17} | "
+            f"client_setup={assignments[idx]['setup_duration_ms']} ms | "
+            f"server_setup={assignments[idx]['server_setup_duration_ms']} ms | "
+            f"sent={assignments[idx]['setup_sent_bytes']} B | recv={assignments[idx]['setup_received_bytes']} B"
+        )
 
 def client_auth_cmd(protocol: str, client_bin: str, client_workdir: str) -> str:
     cfg = PROTOCOLS[protocol]
@@ -808,10 +915,8 @@ def execute_concurrent_batch(protocol: str, client_bin: str, clients, assignment
         metrics = parse_client_metrics(cleaned)
         status = "AUTH_SUCCESS" if rc == 0 and metrics["auth_duration_ms"] is not None else "AUTH_FAILED"
         row = base_row(protocol, test_id, workload, assignments[i], i + 1, round_index, i + 1)
+        add_full_session_metrics(protocol, assignments[i], row, metrics)
         row.update({
-            "auth_duration_ms": metrics["auth_duration_ms"],
-            "auth_sent_bytes": metrics["auth_sent_bytes"],
-            "auth_received_bytes": metrics["auth_received_bytes"],
             "client_cert_sha256": metrics.get("client_cert_sha256"),
             "request_bytes": metrics.get("request_bytes"),
             "response_bytes": metrics.get("response_bytes"),
@@ -854,10 +959,8 @@ def execute_sequential(protocol: str, client_bin: str, client, assignment: Dict,
             }
             status = "AUTH_SUCCESS" if rc == 0 and metrics["auth_duration_ms"] is not None else "AUTH_FAILED"
             row = base_row(protocol, "2", "sequential", assignment, iteration, 1, iteration)
+            add_full_session_metrics(protocol, assignment, row, metrics)
             row.update({
-                "auth_duration_ms": metrics["auth_duration_ms"],
-                "auth_sent_bytes": metrics["auth_sent_bytes"],
-                "auth_received_bytes": metrics["auth_received_bytes"],
                 "request_bytes": metrics.get("request_bytes"),
                 "response_bytes": metrics.get("response_bytes"),
                 "device_id": metrics.get("device_id"),
@@ -883,10 +986,8 @@ def execute_sequential(protocol: str, client_bin: str, client, assignment: Dict,
         metrics = parse_client_metrics(output)
         status = "AUTH_SUCCESS" if rc == 0 and metrics["auth_duration_ms"] is not None else "AUTH_FAILED"
         row = base_row(protocol, "2", "sequential", assignment, iteration, 1, iteration)
+        add_full_session_metrics(protocol, assignment, row, metrics)
         row.update({
-            "auth_duration_ms": metrics["auth_duration_ms"],
-            "auth_sent_bytes": metrics["auth_sent_bytes"],
-            "auth_received_bytes": metrics["auth_received_bytes"],
             "client_cert_sha256": metrics.get("client_cert_sha256"),
             "request_bytes": metrics.get("request_bytes"),
             "response_bytes": metrics.get("response_bytes"),
@@ -905,6 +1006,46 @@ def execute_sequential(protocol: str, client_bin: str, client, assignment: Dict,
     return rows
 
 
+def add_zkarche_server_full_session_fields(server_rows: List[Dict], assignments: List[Dict]) -> List[Dict]:
+    """Add server-side ZK-ARCHE setup+auth columns to server metric rows.
+
+    Server rows are produced during online auth. For ZK-ARCHE full-session
+    accounting, attach the setup metric captured during per-client enrollment.
+    The row is matched by server_peer IP address.
+    """
+    by_ip = {a["client_ip"]: a for a in assignments}
+    for row in server_rows:
+        peer = str(row.get("server_peer") or "")
+        ip = peer.split(":", 1)[0].strip().strip('"')
+        a = by_ip.get(ip)
+        setup_ms = a.get("server_setup_duration_ms") if a else None
+        setup_sent = a.get("server_setup_sent_bytes") if a else None
+        setup_recv = a.get("server_setup_received_bytes") if a else None
+        auth_ms = row.get("server_auth_duration_ms")
+        auth_sent = row.get("server_sent_bytes")
+        auth_recv = row.get("server_received_bytes")
+        row["server_setup_duration_ms"] = setup_ms
+        row["server_setup_sent_bytes"] = setup_sent
+        row["server_setup_received_bytes"] = setup_recv
+        if setup_ms is not None and auth_ms is not None:
+            row["server_full_session_duration_ms"] = round(float(setup_ms) + float(auth_ms), 4)
+        else:
+            row["server_full_session_duration_ms"] = auth_ms
+        if setup_sent is not None and auth_sent is not None:
+            row["server_full_session_sent_bytes"] = int(setup_sent) + int(auth_sent)
+        else:
+            row["server_full_session_sent_bytes"] = auth_sent
+        if setup_recv is not None and auth_recv is not None:
+            row["server_full_session_received_bytes"] = int(setup_recv) + int(auth_recv)
+        else:
+            row["server_full_session_received_bytes"] = auth_recv
+        if row.get("server_full_session_sent_bytes") is not None and row.get("server_full_session_received_bytes") is not None:
+            row["server_full_session_total_bytes"] = int(row["server_full_session_sent_bytes"]) + int(row["server_full_session_received_bytes"])
+        else:
+            row["server_full_session_total_bytes"] = None
+    return server_rows
+
+
 def write_csv(path: Path, rows: List[Dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -917,11 +1058,13 @@ def write_csv(path: Path, rows: List[Dict]) -> None:
 
 
 def print_batch_summary(test_label: str, rows: List[Dict]) -> None:
-    ok = [r for r in rows if r["status"] == "AUTH_SUCCESS" and r["auth_duration_ms"] is not None]
+    metric_key = "full_session_duration_ms" if rows and "full_session_duration_ms" in rows[0] else "auth_duration_ms"
+    ok = [r for r in rows if r["status"] == "AUTH_SUCCESS" and r.get(metric_key) is not None]
     failed = len(rows) - len(ok)
     if ok:
-        avg = sum(float(r["auth_duration_ms"]) for r in ok) / len(ok)
-        print(f"{test_label}: success={len(ok)}, failed={failed}, mean_auth_ms={avg:.4f}")
+        avg = sum(float(r[metric_key]) for r in ok) / len(ok)
+        label = "mean_full_session_ms" if metric_key == "full_session_duration_ms" else "mean_auth_ms"
+        print(f"{test_label}: success={len(ok)}, failed={failed}, {label}={avg:.4f}")
     else:
         print(f"{test_label}: success=0, failed={failed}")
 
@@ -972,7 +1115,10 @@ def run_protocol_tests(project_root: Path, protocol: str, bins: Tuple[str, str],
             print_batch_summary("Test 1", rows)
             write_csv(Path(args.results_dir) / f"{protocol}_test1_concurrent.csv", rows)
             server_rows = collect_server_metrics(protocol, server, server_metric_offset, "1", "concurrent", 1)
-            print_batch_summary("Test 1 server", [{"status": "AUTH_SUCCESS", "auth_duration_ms": r["server_auth_duration_ms"]} for r in server_rows])
+            if protocol == "zkarche":
+                server_rows = add_zkarche_server_full_session_fields(server_rows, assignments)
+            server_metric_key = "server_full_session_duration_ms" if protocol == "zkarche" else "server_auth_duration_ms"
+            print_batch_summary("Test 1 server", [{"status": "AUTH_SUCCESS", "auth_duration_ms": r[server_metric_key]} for r in server_rows])
             write_csv(Path(args.results_dir) / f"{protocol}_test1_concurrent_server.csv", server_rows)
 
         if "2" in selected_tests:
@@ -981,7 +1127,10 @@ def run_protocol_tests(project_root: Path, protocol: str, bins: Tuple[str, str],
             print_batch_summary("Test 2", rows)
             write_csv(Path(args.results_dir) / f"{protocol}_test2_sequential.csv", rows)
             server_rows = collect_server_metrics(protocol, server, server_metric_offset, "2", "sequential", 1)
-            print_batch_summary("Test 2 server", [{"status": "AUTH_SUCCESS", "auth_duration_ms": r["server_auth_duration_ms"]} for r in server_rows])
+            if protocol == "zkarche":
+                server_rows = add_zkarche_server_full_session_fields(server_rows, assignments)
+            server_metric_key = "server_full_session_duration_ms" if protocol == "zkarche" else "server_auth_duration_ms"
+            print_batch_summary("Test 2 server", [{"status": "AUTH_SUCCESS", "auth_duration_ms": r[server_metric_key]} for r in server_rows])
             write_csv(Path(args.results_dir) / f"{protocol}_test2_sequential_server.csv", server_rows)
 
         if "3" in selected_tests:
@@ -993,8 +1142,11 @@ def run_protocol_tests(project_root: Path, protocol: str, bins: Tuple[str, str],
                 all_rows.extend(rows)
                 print_batch_summary(f"Test 3 round {round_index:02d}", rows)
                 server_rows = collect_server_metrics(protocol, server, server_metric_offset, "3", "high_load", round_index)
+                if protocol == "zkarche":
+                    server_rows = add_zkarche_server_full_session_fields(server_rows, assignments)
                 all_server_rows.extend(server_rows)
-                print_batch_summary(f"Test 3 server round {round_index:02d}", [{"status": "AUTH_SUCCESS", "auth_duration_ms": r["server_auth_duration_ms"]} for r in server_rows])
+                server_metric_key = "server_full_session_duration_ms" if protocol == "zkarche" else "server_auth_duration_ms"
+                print_batch_summary(f"Test 3 server round {round_index:02d}", [{"status": "AUTH_SUCCESS", "auth_duration_ms": r[server_metric_key]} for r in server_rows])
             write_csv(Path(args.results_dir) / f"{protocol}_test3_high_load.csv", all_rows)
             write_csv(Path(args.results_dir) / f"{protocol}_test3_high_load_server.csv", all_server_rows)
 
