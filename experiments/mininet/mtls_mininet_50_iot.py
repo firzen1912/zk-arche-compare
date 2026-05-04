@@ -108,6 +108,25 @@ def run_local(cmd, cwd=None, check=True):
     return result.stdout.strip()
 
 
+def cert_fingerprint_sha256_pem(cert_path):
+    """Return SHA-256 over the certificate DER bytes, matching Rustls CertificateDer::as_ref()."""
+    der = subprocess.check_output(
+        ["openssl", "x509", "-in", str(cert_path), "-outform", "der"],
+        stderr=subprocess.STDOUT,
+    )
+    import hashlib
+    return hashlib.sha256(der).hexdigest()
+
+
+def prepare_mtls_authorized_clients(project_root, protocol_workdir):
+    """Create the upgraded mTLS allowlist consumed by MTLS_ALLOWED_CLIENTS_FILE."""
+    fp = cert_fingerprint_sha256_pem(Path(project_root) / "certs" / "client.crt")
+    allowlist = Path(protocol_workdir) / "server" / "certs" / "authorized_clients.txt"
+    allowlist.parent.mkdir(parents=True, exist_ok=True)
+    allowlist.write_text(f"# Authorized mTLS client certificate fingerprints\n{fp}\n")
+    return fp
+
+
 def parse_duration_to_ms(duration_text):
     """Parse Rust Debug Duration fragments like 1.23ms, 450.1µs, 2.0s."""
     if not duration_text:
@@ -131,17 +150,23 @@ def parse_duration_to_ms(duration_text):
 
 def parse_client_metrics(output):
     """
-    Extracts lines like:
+    Supports both the original compact metric line and the upgraded mTLS line:
       CLIENT METRICS -> Duration: 5.123ms, Sent: 417 bytes, Received: 192 bytes
+      CLIENT METRICS -> Protocol: mTLS/TCP, Duration: 5.123ms, Sent: 417 bytes, Received: 192 bytes, ...
     """
     metrics = {
         "protocol_duration_ms": None,
         "sent_bytes": None,
         "received_bytes": None,
+        "client_cert_sha256": None,
+        "request_bytes": None,
+        "response_bytes": None,
+        "device_id": None,
     }
 
     pattern = re.compile(
-        r"CLIENT METRICS\s*->\s*Duration:\s*([^,]+),\s*Sent:\s*(\d+)\s*bytes,\s*Received:\s*(\d+)\s*bytes"
+        r"CLIENT METRICS\s*->\s*(?:Protocol:\s*[^,]+,\s*)?"
+        r"Duration:\s*([^,]+),\s*Sent:\s*(\d+)\s*bytes,\s*Received:\s*(\d+)\s*bytes"
     )
     for line in output.splitlines():
         m = pattern.search(line)
@@ -150,6 +175,23 @@ def parse_client_metrics(output):
             metrics["protocol_duration_ms"] = round(parsed, 4) if parsed is not None else None
             metrics["sent_bytes"] = int(m.group(2))
             metrics["received_bytes"] = int(m.group(3))
+
+            for key, metric_key in [
+                ("ClientCertSHA256", "client_cert_sha256"),
+                ("RequestBytes", "request_bytes"),
+                ("ResponseBytes", "response_bytes"),
+                ("DeviceID", "device_id"),
+            ]:
+                km = re.search(rf"{key}:\s*([^,]+)", line)
+                if km:
+                    val = km.group(1).strip()
+                    if metric_key in ("request_bytes", "response_bytes"):
+                        try:
+                            metrics[metric_key] = int(val)
+                        except ValueError:
+                            metrics[metric_key] = None
+                    else:
+                        metrics[metric_key] = val
     return metrics
 
 
@@ -274,6 +316,8 @@ def run_protocol(project_root, protocol, server_bin, client_bin, num_clients, ou
 
     assignments = make_assignments(num_clients, protocol_workdir)
     copy_certs_if_needed(project_root, protocol, protocol_workdir, assignments)
+    mtls_fp = prepare_mtls_authorized_clients(project_root, protocol_workdir)
+    print(f"Prepared mTLS client certificate allowlist with SHA-256 fingerprint: {mtls_fp}")
 
     net, server, clients = build_network(assignments)
     results = []
@@ -294,9 +338,13 @@ def run_protocol(project_root, protocol, server_bin, client_bin, num_clients, ou
 
         server_dir = protocol_workdir / "server"
         server_args = cfg["server_args"].format(bind=bind, server=server_addr)
+        server_env = (
+            "MTLS_MAX_ACTIVE_CONNECTIONS=128 "
+            "MTLS_ALLOWED_CLIENTS_FILE=certs/authorized_clients.txt "
+        )
         server_cmd = (
             f"cd {shlex.quote(str(server_dir))} && "
-            f"{shlex.quote(server_bin)} {server_args} "
+            f"{server_env}{shlex.quote(server_bin)} {server_args} "
             f"> /tmp/{protocol}_server_mininet.log 2>&1 &"
         )
         info(f"*** Starting {title} server\n")
@@ -307,7 +355,13 @@ def run_protocol(project_root, protocol, server_bin, client_bin, num_clients, ou
             a = assignments[idx]
             cdir = a["client_workdir"]
             client_args = cfg["client_args"].format(bind=bind, server=server_addr)
-            auth_cmd = f"cd {shlex.quote(cdir)} && {shlex.quote(client_bin)} {client_args}"
+            device_id = a["client_host"]
+            auth_cmd = (
+                f"cd {shlex.quote(cdir)} && "
+                f"MTLS_DEVICE_ID={shlex.quote(device_id)} "
+                f"MTLS_PAYLOAD={shlex.quote('mininet-industry-style-mtls-auth-check')} "
+                f"{shlex.quote(client_bin)} {client_args}"
+            )
 
             wall_start = time.perf_counter()
             rc, output = host_cmd_with_status(client, auth_cmd)
@@ -328,6 +382,10 @@ def run_protocol(project_root, protocol, server_bin, client_bin, num_clients, ou
                 "auth_duration_ms": metrics["protocol_duration_ms"],
                 "auth_sent_bytes": metrics["sent_bytes"],
                 "auth_received_bytes": metrics["received_bytes"],
+                "client_cert_sha256": metrics.get("client_cert_sha256"),
+                "request_bytes": metrics.get("request_bytes"),
+                "response_bytes": metrics.get("response_bytes"),
+                "device_id": metrics.get("device_id"),
                 "auth_wall_elapsed_ms": wall_elapsed_ms,
                 "status": status,
                 "return_code": rc,
