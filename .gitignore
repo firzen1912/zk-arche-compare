@@ -19,3 +19,4 @@ benchmarks/plots/
 results/security/
 fuzz/artifacts/
 fuzz/corpus/
+fuzz
