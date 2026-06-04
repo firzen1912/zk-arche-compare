@@ -97,6 +97,17 @@ typedef struct {
     size_t cap;
 } failure_tracker_t;
 
+static char *xstrdup(const char *s) {
+    size_t n;
+    char *out;
+    if (!s) return NULL;
+    n = strlen(s) + 1;
+    out = (char *)malloc(n);
+    if (!out) return NULL;
+    memcpy(out, s, n);
+    return out;
+}
+
 static double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -910,7 +921,7 @@ static int failure_tracker_note_failure(failure_tracker_t *ft, const char *peer)
             ft->cap = new_cap;
         }
         st = &ft->items[ft->n++];
-        st->peer = strdup(peer);
+        st->peer = xstrdup(peer);
         if (!st->peer) return -1;
         st->first_failure = now;
         st->failures = 0;
@@ -1092,18 +1103,15 @@ static int handle_client(int cfd, const uint8_t server_sk[32], const uint8_t ser
         if (!bench_mode()) {
             int replay_ok = replay_cache_check_and_insert(replay, pid, nonce_c);
             if (replay_ok == 0) {
-                fprintf(stderr, "Server[AUTH]: replay detected for pid/nonce_c
-");
+                fprintf(stderr, "Server[AUTH]: replay detected for pid/nonce_c\n");
                 return -1;
             }
             if (replay_ok < 0) {
-                fprintf(stderr, "Server[AUTH]: replay cache insert failed
-");
+                fprintf(stderr, "Server[AUTH]: replay cache insert failed\n");
                 return -1;
             }
             if (replay_cache_persist_if_due(replay, 0) != 0) {
-                fprintf(stderr, "Server[AUTH]: replay cache persist failed
-");
+                fprintf(stderr, "Server[AUTH]: replay cache persist failed\n");
                 return -1;
             }
         }
@@ -1215,8 +1223,7 @@ int main(int argc, char **argv) {
 
     if (load_registry(&reg, &reg_n) != 0) return 1;
     if (replay_cache_load(&replay, REPLAY_CACHE_BIN) != 0) {
-        fprintf(stderr, "Failed to load replay cache; refusing to start because replay state may be corrupt
-");
+        fprintf(stderr, "Failed to load replay cache; refusing to start because replay state may be corrupt\n");
         return 1;
     }
 
@@ -1259,8 +1266,7 @@ int main(int argc, char **argv) {
             int rc;
             peer_to_string(cfd, peer, sizeof peer);
             if (!bench_mode() && failure_tracker_is_blocked(&failures, peer)) {
-                fprintf(stderr, "Server: rejecting temporarily rate-limited peer %s
-", peer);
+                fprintf(stderr, "Server: rejecting temporarily rate-limited peer %s\n", peer);
                 close(cfd);
                 continue;
             }
