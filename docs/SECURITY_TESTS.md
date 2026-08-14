@@ -1,112 +1,189 @@
 # Security Test Suite
 
-All runnable security tests are organized under `security/`. Each test category has its own standalone script. The Bash and PowerShell launchers allow you to choose one test or run the safe regression subset and save a separate log for each test.
+The current repository uses a **single consolidated security runner**:
+
+```text
+experiments/security/security_test.py
+```
+
+The older top-level `security/` directory and separate Bash/PowerShell wrappers are no longer the authoritative interface. The Makefile now points directly to the consolidated runner.
 
 ## Test categories
 
-| ID | Test | Script | Default log |
-|---:|---|---|---|
-| 1 | Transcript-binding tests | `security/transcript_binding_test.py` | `results/security/logs/01_transcript_binding.log` |
-| 2 | Message mutation tests | `security/message_mutation_test.py` | `results/security/logs/02_message_mutation.log` |
-| 3 | Invalid curve / small-subgroup tests | `security/invalid_curve_small_subgroup_test.py` | `results/security/logs/03_invalid_curve_small_subgroup.log` |
-| 4 | DoS resilience tests | `security/dos_resilience_test.py` | `results/security/logs/04_dos_resilience_<protocol>.log` |
-| 5 | Session uniqueness / nonce-reuse tests | `security/session_uniqueness_nonce_reuse_test.py` | `results/security/logs/05_session_uniqueness_nonce_reuse.log` |
-| 6 | Packet parser fuzzing | `security/packet_fuzzing_test.py` | `results/security/logs/06_packet_fuzzing.log` |
-| 7 | Replay-cache tests | `security/replay_cache_test.py` | `results/security/logs/07_replay_cache.log` |
-| 8 | Side-channel / RNG analysis | `security/side_channel_rng_analysis_test.py` | `results/security/logs/08_side_channel_rng_analysis.log` |
+| Test | Purpose |
+| --- | --- |
+| `transcript` | Transcript/domain-separation and binding regressions |
+| `mutation` | Systematic near-valid message mutation tests |
+| `invalid-curve` | Invalid Ristretto/identity/canonical-scalar/parser boundary tests |
+| `session` | Session-key uniqueness, nonce reuse, and concurrency checks |
+| `replay` | Replay-cache state-machine and concurrency checks |
+| `side-channel` | RNG, dependency, and source-hygiene screening |
+| `fuzz` | `cargo-fuzz`/libFuzzer packet-parser campaign |
+| `dos` | Authorized local malformed/resource-stressing TCP resilience test |
 
-The Rust regression-test implementation lives in `security/rust/security_zkarche.rs`. The integration-test file under `tests/security_zkarche.rs` is only a shim so `cargo test --test security_zkarche` can still run normally.
+The runner can also install its embedded Rust regression/fuzz files when needed.
 
-## Run with Bash
+## Recommended safe regression run
 
-Run the safe regression subset:
-
-```bash
-bash security/run_security_tests.sh --test all
-```
-
-Run a specific test:
+Use the Makefile target:
 
 ```bash
-bash security/run_security_tests.sh --test transcript
-bash security/run_security_tests.sh --test mutation
-bash security/run_security_tests.sh --test invalid-curve
-bash security/run_security_tests.sh --test session
-bash security/run_security_tests.sh --test replay
-bash security/run_security_tests.sh --test side-channel
+make security-test
 ```
 
-Run packet-parser fuzzing:
+or:
+
+```bash
+make security-safe
+```
+
+These targets run:
+
+```text
+transcript
+mutation
+invalid-curve
+session
+replay
+side-channel
+```
+
+They intentionally avoid the fuzz and live-server DoS categories.
+
+## Run one category
+
+```bash
+python3 experiments/security/security_test.py --test transcript
+python3 experiments/security/security_test.py --test mutation
+python3 experiments/security/security_test.py --test invalid-curve
+python3 experiments/security/security_test.py --test session
+python3 experiments/security/security_test.py --test replay
+python3 experiments/security/security_test.py --test side-channel
+```
+
+Equivalent Makefile targets are available:
+
+```bash
+make security-transcript
+make security-mutation
+make security-invalid-curve
+make security-session
+make security-replay
+make security-side-channel
+```
+
+## Fuzzing
+
+The fuzz category uses `cargo +nightly fuzz` and the `packet_parsers` target.
 
 ```bash
 cargo install cargo-fuzz
-bash security/run_security_tests.sh --test fuzz --fuzz-seconds 300
+python3 experiments/security/security_test.py --test fuzz --seconds 300
 ```
 
-Run DoS testing against a running ZK-ARCHE server:
+or:
 
 ```bash
-./target/debug/zkarche_server --bind 127.0.0.1:4000 --pairing --pairing-token test-token
+make security-fuzz
 ```
 
-In another terminal:
+The Makefile's default fuzz duration is 60 seconds. Use the runner directly for a custom duration.
+
+## DoS resilience testing
+
+Only run the DoS harness against systems you own or are explicitly authorized to test.
+
+Start the protocol server first, then run for ZK-ARCHE:
 
 ```bash
-bash security/run_security_tests.sh --test dos --protocol zkarche --host 127.0.0.1 --port 4000
+python3 experiments/security/security_test.py \
+  --test dos \
+  --protocol zkarche \
+  --host 127.0.0.1 \
+  --port 4000
 ```
 
-For EDHOC or mTLS:
+Makefile shortcuts:
 
 ```bash
-bash security/run_security_tests.sh --test dos --protocol edhoc --port 5688
-bash security/run_security_tests.sh --test dos --protocol mtls --port 7443
+make security-dos-zkarche
+make security-dos-edhoc
+make security-dos-mtls
 ```
 
-## Run with PowerShell
+Default ports used by those targets are:
 
-Run the safe regression subset:
+| Protocol | Port |
+| --- | ---: |
+| ZK-ARCHE | 4000 |
+| EDHOC | 5688 |
+| mTLS | 7443 |
 
-```powershell
-powershell -ExecutionPolicy Bypass -File security/run_security_tests.ps1 -Test all
+The DoS runner can optionally execute a recovery command before and after malformed traffic:
+
+```bash
+python3 experiments/security/security_test.py \
+  --test dos \
+  --protocol zkarche \
+  --host 127.0.0.1 \
+  --port 4000 \
+  --recovery-cmd './target/release/zkarche_client --server 127.0.0.1:4000'
 ```
 
-Run one test:
+## Full runner
 
-```powershell
-powershell -ExecutionPolicy Bypass -File security/run_security_tests.ps1 -Test transcript
-powershell -ExecutionPolicy Bypass -File security/run_security_tests.ps1 -Test mutation
-powershell -ExecutionPolicy Bypass -File security/run_security_tests.ps1 -Test invalid-curve
-powershell -ExecutionPolicy Bypass -File security/run_security_tests.ps1 -Test session
-powershell -ExecutionPolicy Bypass -File security/run_security_tests.ps1 -Test replay
-powershell -ExecutionPolicy Bypass -File security/run_security_tests.ps1 -Test side-channel
+The runner's `--test all` mode currently includes **all eight categories**, including fuzzing and DoS:
+
+```bash
+python3 experiments/security/security_test.py --test all
 ```
 
-Run fuzzing:
+or:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File security/run_security_tests.ps1 -Test fuzz -FuzzSeconds 300
+```bash
+make security-all
 ```
 
-Run DoS testing:
+Do not use `security-all` as a routine quick check unless the required server is running and you intend to execute both fuzzing and the DoS harness.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File security/run_security_tests.ps1 -Test dos -Protocol zkarche -HostName 127.0.0.1 -Port 4000
-```
+## Evidence and output
 
-## Output files
-
-All tests create logs under:
+The consolidated runner writes raw logs under:
 
 ```text
 results/security/logs/
 ```
 
-The DoS and RNG/side-channel scripts also create CSV files under:
+Per-test evidence CSVs are written under:
 
 ```text
-results/security/
+results/security/csv/
 ```
+
+It also emits aggregate evidence artifacts:
+
+```text
+results/security/security_evidence.json
+results/security/security_evidence.csv
+```
+
+The runner records test parameters and observed results so experiment claims can be tied to exact evidence rather than only a pass/fail label.
+
+## Side-channel / RNG scope
+
+The side-channel category is a **screening test**, not a full side-channel certification. It checks items such as:
+
+- OS RNG sample duplication and bit balance;
+- presence of `zeroize`;
+- presence of `subtle`;
+- source patterns that may log secret material; and
+- items that still require manual timing/power analysis.
+
+A passing result should not be interpreted as proving absence of timing, cache, electromagnetic, or power side channels.
 
 ## Notes
 
-`--test all` intentionally excludes DoS and fuzzing by default. DoS requires a running server, and fuzzing can run for a long time. Run those explicitly when needed.
+- Minimize environmental changes between comparative runs.
+- Preserve raw logs and per-test CSV evidence for reproducibility.
+- Run fuzzing for a materially longer campaign when using it as thesis/security evidence.
+- DoS testing requires an authorized live target and should be separated from normal regression tests.
